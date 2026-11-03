@@ -1,0 +1,234 @@
+task:
+  name: promoter_celltype
+  description: 'Generate 200bp synthetic cis-regulatory elements (CREs) with cell-type
+
+    specificity for K562 or HepG2 on the Gosai et al. 2024 MPRA dataset. The
+
+    base policy is HyenaDNA-large initialized from
+
+    cell-type-conditioned supervised fine-tuning.
+
+    '
+  score_semantics:
+    target_cells:
+    - K562
+    - HepG2
+    target_activity_floor_by_cell:
+      K562: null
+      HepG2: null
+    oracle_panels:
+      malinois:
+        oracle_columns:
+        - K562
+        - HepG2
+        off_target_cells_by_target:
+          K562:
+          - HepG2
+          HepG2:
+          - K562
+      agarwal:
+        oracle_columns:
+        - K562
+        - HepG2
+        off_target_cells_by_target:
+          K562:
+          - HepG2
+          HepG2:
+          - K562
+      enformer_mpra:
+        oracle_columns:
+        - K562
+        - HepG2
+        off_target_cells_by_target:
+          K562:
+          - HepG2
+          HepG2:
+          - K562
+      grammar_prior:
+        oracle_columns:
+        - K562
+        - HepG2
+        off_target_cells_by_target:
+          K562:
+          - HepG2
+          HepG2:
+          - K562
+  success:
+    requirements:
+    - id: raw_legal
+      metric: legal_ratio
+      strata:
+      - K562
+      - HepG2
+      minimum: 1.0
+      min_count: 128
+    - id: condition_valid
+      metric: condition_valid_ratio
+      strata:
+      - all
+      minimum: 1.0
+      min_count: 256
+    - id: generated_count
+      metric: generated_count
+      strata:
+      - K562
+      - HepG2
+      minimum: 128
+      maximum: 128
+      min_count: 1
+    - id: malinois_finite
+      metric: malinois_finite_ratio
+      strata:
+      - K562
+      - HepG2
+      minimum: 1.0
+      min_count: 128
+    # The control layer ranks each condition's candidates on that condition's own stratum
+    # (control/selection.condition_values), so the two strata are not combined into a worst-cell value.
+    ranking:
+    - metric: malinois_median_mingap_raw
+      strata:
+      - K562
+      - HepG2
+      direction: maximize
+      tolerance: auto
+    metric_sources:
+      condition_valid_ratio: []
+      generated_count: []
+      legal_ratio: []
+      malinois_finite_ratio:
+      - malinois
+      malinois_median_mingap_raw:
+      - malinois
+base_models:
+- id: hyenadna-large-sft-cell
+  model: backends/promoter_rl/outputs/sft_cell_only/checkpoint-62500
+  init: sft.completion_only
+  notes: 'HyenaDNA-large (width 256, 8 layers) after 20-epoch cell-type-conditioned
+
+    SFT on ~330k high-activity Gosai sequences. This is the RL starting policy,
+
+    not the raw pretrained base. The checkpoint contains three cell
+
+    tokens, but this experiment uses only <CELL_K562>=12 and <CELL_HepG2>=13.
+
+    Referenced via tasks.promoter.assets.SFT_POLICY_DIR.
+
+    '
+data:
+  unified_parquet: backends/promoter_rl/data/processed/sft_multicell_specific_sknsh.parquet
+  sequence_column: sequence
+  conditioning_prompts:
+  - <CELL_K562>
+  - <CELL_HepG2>
+  token_alphabet: ACGT
+oracles:
+  candidate_pool:
+  - id: malinois
+    class: tasks.promoter.oracles.malinois.MalinoisOracle
+    use_for: reward
+    notes: Reward-eligible Gosai MPRA predictor used for the MinGap objective.
+  - id: enformer_mpra
+    class: tasks.promoter.oracles.enformer_mpra.EnformerMPRAOracle
+    use_for: required_sentinel
+    notes: 'Enformer architecture fine-tuned on Malinois MPRA data. It adds
+
+      architecture diversity, not an independent experimental data source.
+
+      Required held-out sentinel: the runner keeps it in the sentinel pool and
+
+      it is never offered to the loop as a spend.
+
+      '
+  - id: grammar_prior
+    class: tasks.promoter.oracles.grammar_prior.GrammarPriorOracle
+    use_for: spendable_sentinel
+    notes: Capped master-TF motif presence for each target cell. Initially held out
+      and eligible for reward promotion. Repetition control is an explicit scalar
+      reward penalty.
+  - id: chrombpnet
+    class: tasks.promoter.oracles.chrombpnet.ChromBPNetOracle
+    use_for: audit
+    notes: Framework-owned terminal blind evaluator in the primary anti-leakage fold.
+  - id: agarwal
+    class: tasks.promoter.oracles.agarwal_lentimpra.AgarwalLentiMPRAOracle
+    use_for: sentinel
+    notes: Cross-dataset computational sentinel for both target cells.
+  source_roles:
+    primary_fold:
+      reward_pool:
+      - malinois
+      - grammar_prior
+      required_enabled_oracles:
+      - malinois
+      sentinel_pool:
+      - enformer_mpra
+      - agarwal
+      - grammar_prior
+      required_sentinels:
+      - agarwal
+      - enformer_mpra
+      audit_oracles:
+      - chrombpnet
+framework:
+  eval_samples_per_prompt: 512
+recipe_capabilities:
+  allowed_reward_fields:
+  - enabled_oracles
+  - held_out_oracles
+  - oracle_utilities
+  - aggregator
+  - penalties
+  - gates
+  editable_hyperparameters:
+    # 5e-05 is the initial recipe's lr; the declaration, not code, sets the ceiling
+    # the agent can reach.
+    lr:
+      type: number
+      minimum: 1.0e-06
+      maximum: 5.0e-05
+    kl:
+      type: number
+      minimum: 0.001
+      maximum: 0.2
+    group_size:
+      type: integer
+      enum:
+      - 8
+      - 16
+      - 32
+  allowed_primitives:
+  - - per_oracle_utility
+    - target_default
+  - - per_oracle_utility
+    - gap_ema_zscore
+  - - per_sequence_penalty
+    - seen_penalty
+  - - hard_biological_gate
+    - gc_bounds_gate
+  - - hard_biological_gate
+    - homopolymer_gate
+  - - hard_biological_gate
+    - dinucleotide_entropy_gate
+  - - per_sequence_penalty
+    - repeated_kmer
+  - - per_sequence_penalty
+    - at_homopoly
+  frozen_requirements: {}
+  frozen_target_objectives: {}
+  frozen_hyperparameters: {}
+  runtime_parameters: {}
+  allow_primitive_requests: true
+  synthesizable_roles:
+  - per_oracle_utility
+  - cross_oracle_aggregation
+  - per_sequence_penalty
+  - hard_biological_gate
+delivery:
+  protocol: selected_evaluation_library_v1
+  evaluation_candidates: 512
+  count: 128
+  primary_oracle: malinois
+  selection_aggregation: primary
+  deduplication: exact
+  exclude_training_copies: true

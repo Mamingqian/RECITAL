@@ -1,0 +1,131 @@
+task_family: loopseq
+contract_path: configs/loopseq_contract.yaml
+# Bounds the TRAINING levers and leaves the reward levers -- oracles, gates, penalties,
+# transforms, aggregator -- entirely free. Set from the initial recipe (lr 1e-4, kl 0.02): lr from half to
+# five times it, kl from a quarter to twice it. Loop-seq's blind estimand is bounded by 1.0 and saturates (the
+# worst-condition DNAcycP2 hit rate varies by a few sequences out of 128), so it cannot support an evidence-based bound.
+hyperparameter_bounds:
+  lr:
+    type: number
+    minimum: 0.00005
+    maximum: 0.0005
+  kl:
+    type: number
+    minimum: 0.005
+    maximum: 0.04
+# fp32: bf16 is emulated rather than native below compute capability 8.0, and
+# torch.cuda.is_bf16_supported() answers True there, so nothing catches this except the explicit declaration:
+# training.policy_precision.resolve_bf16 refuses the default rather than downgrading it silently. Declare bf16 for
+# GPUs of compute capability 8.0 or higher.
+training_precision: fp32
+protocol_condition: no_self_validation
+seed: 0
+# Eighteen candidates at the declared default of 3000 updates each. A candidate that trains deeper leaves
+# fewer updates for the rounds after it, which is the trade the search is asked to make.
+total_updates: 54000
+initial_schedule_horizon: 16000
+online_generation:
+  count: 512
+  count_scope: per_condition
+  temperature: 1.0
+  top_p: 1.0
+  batch_size: 64
+delivery:
+  count: 128
+  count_scope: per_condition
+# The primary is the fraction of the delivered rows inside the condition's DNAcycP2 band, the
+# mean per condition and the minimum over conditions. It is bounded by 1.0 and saturates, so `secondary`
+# reports the median signed distance inside the band (raw DNAcycP2 coordinates, target scale
+# 1.0): positive inside, negative outside, per condition and the minimum over conditions. It is
+# a second statistic of the same terminal scores and does not replace the primary.
+blind_report:
+  primary_source: dnacycp2
+  metric: fixed_raw_interval_hit_rate
+  within_condition: mean
+  across_conditions: minimum
+  incomplete_scores: report_incomplete_with_original_denominator
+  secondary:
+    metric: raw_interval_margin
+    within_condition: median
+    across_conditions: minimum
+    incomplete_scores: report_incomplete_with_original_denominator
+
+control:
+  proposals:
+    candidates_per_round: 3
+    candidate_budget: 18
+    rounds_min: 4
+    rounds_max: 6
+    anchor_candidate: true
+    max_decision_attempts: 3
+    max_skipped_rounds: 1
+  budget:
+    steps: {min: 1000, default: 3000, max: 6000}
+  # How a delivered library is chosen from a candidate's pool. The rule reads only the CNN margin and the
+  # sequence-local quality measurements the agent can see.
+  # Rows are taken in order of margin/cnn (signed distance inside the condition's band, in the CNN's
+  # target scale). A row is eligible when it is legal, outside the training set under reverse-complement
+  # identity, the first eligible occurrence of its reverse-complement identity in its condition's pool, and at
+  # or above its condition's floors on dinucleotide entropy and distinct 3-mers. The floors are the conditional quality
+  # reference's own (1st percentile of the training rows of the condition) that the delivery requirements
+  # test, so a selected row passes them. A condition whose pool cannot supply 128 eligible rows delivers
+  # fewer, and the delivery is unqualified: selection never lowers a floor to fill the count.
+  selection:
+    visible_only: true
+    plan:
+      aggregation: single
+      components:
+        - {measurement: margin/cnn}
+      count: {low: 128, mid: 128, high: 128}
+      strata: [low, mid, high]
+      filters:
+        - {measurement: legal, minimum: 1}
+        - {measurement: dinucleotide_entropy, minimum: 2.841609168179741, strata: [low]}
+        - {measurement: dinucleotide_entropy, minimum: 3.0007941332740677, strata: [mid]}
+        - {measurement: dinucleotide_entropy, minimum: 2.93253905168652, strata: [high]}
+        - {measurement: unique_kmer_count, minimum: 20, strata: [low]}
+        - {measurement: unique_kmer_count, minimum: 22, strata: [mid]}
+        - {measurement: unique_kmer_count, minimum: 21, strata: [high]}
+      deduplication: reverse_complement
+      deduplication_scope: within_stratum
+      exclude_training_copies: true
+      missing: error
+  # Library health, relative to the baseline pool (control/health.py).
+  # Same two fractions as the CRE declaration. On Loop-seq pools (50-residue DNA, baseline mean
+  # pairwise 0.58, nearest-neighbour median 0.44) the trained/baseline pairwise ratio stays well above
+  # min_pairwise_ratio over the allowed update range (`budget.steps.max` is 6,000), so these fractions do not bind.
+  health:
+    min_distance_fraction: 0.10
+    min_pairwise_ratio: 0.20
+  stop:
+    require_assignment_qualified: true
+    min_updates_fraction: 0.0
+  # `loopseq_margin`: a source's per-row measurement is its margin, named margin/<source>.
+  selfval:
+    scalar: loopseq_margin
+  # The Coder is on with the four reward roles of the CRE declaration. max_requests is a ceiling on component
+  # requests per cell; llm.max_total_tokens bounds the spend.
+  synthesis:
+    enabled: true
+    roles: [per_oracle_utility, cross_oracle_aggregation, per_sequence_penalty, hard_biological_gate]
+    max_requests: 100
+    attempts_per_request: 3
+llm:
+  model: gpt-6-luna
+  max_prompt_tokens: 60000
+  max_output_tokens: 16000
+  tool_calls_per_decision: 4
+  max_total_tokens: 2000000
+  pricing_usd_per_mtok: {input: null, cached: null, output: null}
+scheduler:
+  max_concurrent_jobs: 27
+  # A Slurm partition of your cluster (a comma-separated list is allowed) and the GPUs per job.
+  partition: gpu
+  gres: "gpu:1"
+  # Per-job request. A Loop-seq job is one process: 2.2-3.0 GB of memory at most and 0.9-1.2 cores of CPU time per
+  # wall hour.
+  cpus: 2
+  mem: 8G
+  time_factor: 1.6
+  max_infra_retries: 2
+  poll_seconds: 60

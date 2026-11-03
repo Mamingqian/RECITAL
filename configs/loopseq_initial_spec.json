@@ -1,0 +1,36 @@
+{
+  "enabled_oracles": [
+    "cnn"
+  ],
+  "held_out_oracles": [
+    "bendnet",
+    "mixbend"
+  ],
+  "transforms": [],
+  "aggregator": {
+    "name": "trimmed_mean",
+    "trim": 0.0
+  },
+  "shape": null,
+  "target_objectives": {
+    "cnn": {
+      "by_condition": {
+        "low": {"upper": -0.44933514443471667, "lower": null},
+        "mid": {"lower": -0.44933514443471667, "upper": 0.32991884970575086},
+        "high": {"lower": 0.32991884970575086, "upper": null}
+      },
+      "coordinate": "raw",
+      "kind": "interval",
+      "scale": 1.0,
+      "units": "z_cyc"
+    }
+  },
+  "penalties": [],
+  "gates": [],
+  "hyperparameters": {
+    "lr": 5e-05,
+    "kl": 0.02,
+    "group_size": 32,
+    "steps": 16000
+  }
+}

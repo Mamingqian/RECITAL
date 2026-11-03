@@ -1,0 +1,110 @@
+task_family: cm
+contract_path: configs/cm_contract.yaml
+asset_root: backends/cm_assets
+# fp32, declared rather than inherited: the CM runtime trains with bf16 off, and the
+# declaration puts that in the run's own config, where `cli preflight` prints it.
+training_precision: fp32
+protocol_condition: no_self_validation
+seed: 2401
+# Fifteen candidates at the declared default of 256 updates use 3840 of this; the rest is for
+# candidates that train deeper (at most control.budget.steps.max each), which leaves fewer updates
+# to the rounds after them.
+total_updates: 7680
+# A from_initial or from_parent stage plans its learning-rate schedule over at least this many
+# updates, which is control.budget.steps.max, so the longest allowed candidate is never cut off
+# by its own schedule.
+initial_schedule_horizon: 1024
+# lr and kl are bounded by the contract's `framework.learning_rate_bounds` (5e-06 .. 3e-05) and
+# `framework.kl_bounds` (0.005 .. 0.06), which experiment.py hands the agent unchanged; a window
+# restated here would declare the same numbers twice. The kl window's upper end is twice the initial
+# 0.03; the contract sets both windows structurally, not from outcomes.
+online_generation:
+  count: 512
+  count_scope: total
+  temperature: 1.0
+  top_p: 1.0
+  batch_size: 32
+delivery:
+  count: 128
+  count_scope: total
+blind_report:
+  primary_source: audit_2020_t5
+  secondary_source: audit_2020_esm
+  metric: complementation_prediction
+  within_condition: median
+  across_conditions: minimum
+  incomplete_scores: report_incomplete_with_original_denominator
+
+control:
+  proposals:
+    candidates_per_round: 3
+    candidate_budget: 15
+    rounds_min: 3
+    rounds_max: 5
+    anchor_candidate: true
+    max_decision_attempts: 3
+    max_skipped_rounds: 1
+  budget:
+    steps: {min: 128, default: 256, max: 1024}
+  # How a delivered library is chosen from a candidate's pool. The rule reads only measurements the agent can
+  # see: the contract's own per-sequence score under `selection_aggregation: primary`,
+  # the validation-calibrated function_2026_esm. Rows are taken in rank order from those that are complete
+  # 80-96 residue sequences over the 20 amino acids (so no illegal row reaches a NaN natural distance), within the
+  # contract's delivery.min_natural_distance (0.2) and delivery.max_natural_distance (0.6) of the natural family,
+  # distinct, and not an SFT or predictor training copy. A pool with fewer than 128 such rows delivers fewer and is
+  # unqualified.
+  selection:
+    visible_only: true
+    plan:
+      aggregation: single
+      components:
+        - {measurement: calibrated/function_2026_esm}
+      count: {CM: 128}
+      strata: [CM]
+      filters:
+        - {measurement: legal, minimum: 1}
+        - {measurement: natural_distance, minimum: 0.2, maximum: 0.6}
+      deduplication: exact
+      exclude_training_copies: true
+      alphabet: ACDEFGHIKLMNPQRSTVWY
+      min_length: 80
+      max_length: 96
+      missing: error
+  # Ranking is the contract's declared cm_selection_score, the median calibrated function_2026_esm of the delivered library.
+  # Library health, relative to the baseline pool (control/health.py).
+  # Same two fractions as the CRE declaration.
+  health:
+    min_distance_fraction: 0.10
+    min_pairwise_ratio: 0.20
+  stop:
+    require_assignment_qualified: true
+    min_updates_fraction: 0.0
+  # `cm_raw`: a source's per-row measurement is its raw predictor score, named by the source.
+  selfval:
+    scalar: cm_raw
+  # The Coder is on with the roles the CM adapter lets it write (its synthesizable_roles); per_oracle_utility is not
+  # among them. max_requests is a ceiling on component requests per cell; llm.max_total_tokens bounds the spend.
+  synthesis:
+    enabled: true
+    roles: [cross_oracle_aggregation, per_sequence_penalty, hard_biological_gate]
+    max_requests: 100
+    attempts_per_request: 3
+llm:
+  model: gpt-6-luna
+  max_prompt_tokens: 60000
+  max_output_tokens: 16000
+  tool_calls_per_decision: 4
+  max_total_tokens: 2000000
+  pricing_usd_per_mtok: {input: null, cached: null, output: null}
+scheduler:
+  max_concurrent_jobs: 27
+  # A Slurm partition of your cluster whose GPUs share one model. CM pool generation depends on the GPU model (the
+  # same seed can give pools with very different natural distances on different GPU models), and cm_poet
+  # needs compute capability >= 8 for PoET-2's FlashAttention.
+  partition: gpu
+  gres: "gpu:1"
+  cpus: 2
+  mem: 12G
+  time_factor: 1.6
+  max_infra_retries: 2
+  poll_seconds: 60

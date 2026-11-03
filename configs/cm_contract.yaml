@@ -1,0 +1,272 @@
+modality: protein
+task:
+  name: cm_fullseq
+  description: Generate complete AroQ chorismate-mutase domains with the qualified
+    CM predictors.
+  target_objective: Maximize delivered-library median of validation-calibrated 2026
+    ESM
+  biological_constraints:
+  - Generate all 80 to 96 amino-acid positions from <bos>1 without a wild-type prefix.
+  - Deliver 128 unique sequences with normalized whole-sequence edit distance from the
+    natural family of at least 0.20 and at most 0.60. Distance above 0.40 is also
+    penalized continuously by cm_novelty. The 0.60 bound is a delivery filter of the
+    selection rule (control.selection.plan), not part of the reward, so a candidate whose
+    pool holds fewer than 128 rows within [0.20, 0.60] delivers fewer and is unqualified.
+    A pool-median veto at 0.40 would reject 256 of 256 recorded checkpoint pools and is
+    not used. Because the filter holds by construction, the delivered library staying
+    inside it is not evidence of anything.
+  - Exclude exact SFT and functional-predictor training copies.
+  - Scores predict normalized complementation enrichment; they are not measured activity
+    or probabilities.
+  selection_semantics:
+    metric: cm_selection_score
+    aggregation: primary
+    oracle_sources:
+    - function_2026_esm
+    per_sequence_score: validation-calibrated 2026 ESM
+    candidate_score: median over the selected eligible library
+    library_count: 128
+    delivery_protocol: selected_evaluation_library_v1
+    additional_delivery_draws: 0
+    direction: maximize
+    audit_used_for_selection: false
+representation:
+  alphabet: ACDEFGHIKLMNPQRSTVWY
+  tokenizer: residue
+  min_length: 80
+  max_length: 96
+  variable_length: true
+  pad_token: <pad>
+  eos_token: '2'
+  prefix: ''
+base_models:
+- id: progen3_112m_cm_sft
+  model: runs/cm_experiment/sft/model
+data:
+  source: backends/cm_assets/data/sft.csv
+  sequence_column: sequence
+  token_alphabet: ACDEFGHIKLMNPQRSTVWY
+  conditioning_prompts:
+  - <bos>1
+  max_completion_length: 97
+  min_new_tokens: 80
+sft_checkpoint: backends/cm_assets/sft/model
+oracles:
+  candidate_pool:
+  - id: function_2026_esm
+    notes: Frozen ESM2-650M residue-mean features and three Ridge heads fitted on
+      2624 measured 2026 training sequences. Raw predicted normalized enrichment is
+      the primary reward.
+  - id: function_2026_t5
+    notes: Frozen ProtT5 residue-mean features and three Ridge heads on the same 2026
+      training split. Held-out feedback; never a reward input. The delivery
+      rule declares whether this score is used for selection; primary ranking uses
+      function_2026_esm alone.
+  # `notes` is the text an agent reads for the source, so it describes the predictor and
+  # nothing of how the experiment is designed. Why cm_max is in reward_pool is recorded
+  # beside initial_reward_spec below.
+  - id: cm_max
+    notes: Already implemented maximum of standardized bm/me utilities with the original
+      development calibration. It is a spendable family prior that may be enabled in the
+      reward. Disclosed limit -- cm_bm correlates 0.9963 with this source on the SFT
+      reference, so enabling both buys little new information and mostly reweights one
+      DCA prior. After cm_bm is enabled, this source supplies no independent evidence
+      beyond it.
+  - id: cm_bm
+    notes: Standardized bmDCA utility with the original development calibration. It
+      is a spendable family prior, not a function measurement. Other DCA utilities
+      correlate 0.996-0.999 with it, so enabling this prior does not leave an independent
+      DCA witness. This is a change to the reward, not an additional biological measurement.
+  - id: cm_poet
+    notes: Public PoET-2 weights (Zenodo 16815645) with a fixed 64-sequence unmeasured
+      natural context. Forward-only mean conditional log likelihood per predicted
+      token, including the terminal stop. Negative values are expected; assess changes
+      and uncertainty instead of inferring poor function from the sign or an uncalibrated
+      absolute value. NOT comparable to the historical cm_poet values near -2.7, which
+      came from PoET-1 weights under a bidirectional 32-sequence protocol; PoET-1's
+      checkpoint is lost and has no pinned public source. Runs out of process in the
+      PoET-2 interpreter and needs an Ampere or newer GPU. Online evolutionary feedback
+      only.
+  - id: cm_novelty
+    notes: Two-sided negative shortfall on normalized whole-sequence edit distance
+      from the natural reference; zero between 0.20 and 0.40, negative outside. The
+      upper bound is where published measured function collapses (Russ 2020 35.2%
+      -> 3.8%, Netti 2026 28.4% -> 7.2% across 0.4). It is a reward term only, neither
+      a per-sequence delivery gate nor a pool-median veto. Staying inside the measured
+      envelope is the RESULT this experiment reports, so a gate enforcing it could not
+      be evidence for it.
+  - id: audit_2020_esm
+    notes: ESM650 plus separate Ridge ensemble fitted on 1411 nonoverlapping 2020
+      training sequences. Terminal scoring only.
+  - id: audit_2020_t5
+    notes: ProtT5 plus separate Ridge ensemble fitted on the same 2020 split. Main
+      terminal predictor; same CM family and experimental lineage.
+  source_roles:
+    primary:
+      reward_pool:
+      - function_2026_esm
+      - cm_novelty
+      - cm_bm
+      - cm_max
+      sentinel_pool:
+      - function_2026_t5
+      - cm_poet
+      - cm_bm
+      - cm_max
+      required_enabled_oracles:
+      - function_2026_esm
+      - cm_novelty
+      required_sentinels:
+      - function_2026_t5
+      - cm_poet
+      audit_oracles:
+      - audit_2020_esm
+      - audit_2020_t5
+  evidence_dependencies:
+    cm_max:
+    - cm_bm
+    cm_bm:
+    - cm_max
+  poet:
+    python: backends/cm_external/poet2_env/bin/python
+    source: backends/cm_external/PoET-2
+    checkpoint: backends/cm_external/assets/poet-2.ckpt
+    context_count: 64
+    seed: 2001
+    batch_size: 16
+  novelty:
+    floor: 0.2
+    ceiling: 0.4
+initial_reward_spec:
+  # cm_max is enabled in the opening recipe. It is a spendable_sentinel, and it moves the
+  # delivered library into the distance band where the terminal predictor has measured
+  # validity. At natural_distance 0.53 audit_2020_t5 has Spearman 0.027 against measured
+  # function and 0.0 percent of measured designs were functional.
+  #
+  # function_2026_t5 and cm_poet stay held out. cm_bm stays out because it correlates
+  # 0.9963 with cm_max.
+  enabled_oracles:
+  - function_2026_esm
+  - cm_novelty
+  - cm_max
+  held_out_oracles:
+  - function_2026_t5
+  - cm_poet
+  - cm_bm
+  transforms: []
+  aggregator:
+    name: weighted_sum
+    weights:
+      function_2026_esm: 1.0
+      cm_novelty: 1.0
+  shape: null
+  penalties: []
+  gates: []
+  invalid_penalty: -10.0
+  reward_clip_low: -5.0
+  hyperparameters:
+    lr: 1.0e-05
+    kl: 0.03
+    group_size: 16
+    steps: 256
+delivery:
+  count: 128
+  protocol: selected_evaluation_library_v1
+  evaluation_candidates: 512
+  min_natural_distance: 0.2
+  max_natural_distance: 0.6
+  ranking: validation-calibrated 2026 ESM
+  audit:
+  - audit_2020_esm
+  - audit_2020_t5
+  selection_aggregation: primary
+framework:
+  terminal_eligibility:
+    rule_id: complete_evidence_advisory_flags_v2
+    required_monitors: []
+    required_strata:
+    - CM
+  iteration_budget: 8
+  default_steps_per_iter: 256
+  fixed_steps: false
+  min_steps_per_iter: 64
+  max_steps_per_iter: 4096
+  checkpoint_save_steps: 64
+  critic_max_revisions: 2
+  # Bounded at twice the initial_reward_spec's own values in the tightening direction.
+  # Past that the agent would be choosing not to train rather than choosing HOW to train:
+  # kl 0.2 against an initial 0.03 lets it hold the policy still and still call the action
+  # training. The bound is structural and uses no outcome measurement.
+  learning_rate_bounds:
+  - 5.0e-06
+  - 3.0e-05
+  kl_bounds:
+  - 0.005
+  - 0.06
+  reference_library: backends/cm_assets/reference_sequences.csv
+  ablation_matrix:
+    arm: full
+    primary_oracle: function_2026_esm
+    schema_version: 1
+    search_ranking:
+    - direction: maximize
+      metric: cm_primary
+      strata:
+      - CM
+    spendable_oracle: cm_bm
+  search_budget:
+    max_total_updates: 8192
+    first_candidate_updates: 256
+    allowed_candidate_updates:
+    - 64
+    - 128
+    - 256
+    - 512
+    - 1024
+    - 2048
+    - 4096
+    evaluation_mode: final
+    eval_interval_updates: 256
+    max_eval_slots: 8
+    max_trained_candidates: 8
+    max_proposals: 31
+    max_synthesis_attempts: 12
+success:
+  requirements:
+  - id: complete_delivery
+    metric: cm_delivered
+    strata:
+    - CM
+    minimum: 128
+  - id: novel_unique_pool
+    metric: cm_eligible
+    strata:
+    - CM
+    minimum: 128
+  # cm_eligible counts the delivered library, and its floor is the library size. Over the
+  # delivered rows it is exactly the conjunction checkpoints.eligible_pool applies -- valid,
+  # unique, not a training copy, past the distance floor, and finitely scored by
+  # function_2026_esm -- so requiring it to equal the library size is the five per-row ratios.
+  # It carries no condition check, so that one stays declared separately below.
+  - id: valid_condition
+    metric: condition_valid_ratio
+    strata:
+    - CM
+    minimum: 1.0
+    min_count: 128
+  ranking:
+  - metric: cm_selection_score
+    strata:
+    - CM
+    direction: maximize
+  stop_when_qualified: false
+  metric_sources:
+    cm_delivered:
+    - function_2026_esm
+    cm_selection_score:
+    - function_2026_esm
+    cm_primary:
+    - function_2026_esm
+    cm_eligible:
+    - function_2026_esm
+    condition_valid_ratio: []

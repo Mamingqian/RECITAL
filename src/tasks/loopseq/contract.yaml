@@ -1,0 +1,196 @@
+# User contract for the Loop-seq cyclizability task.
+# Plug-in path: tasks.loopseq
+
+task:
+  name: loopseq_3group
+  description: |
+    Generate 50bp DNA sequences targeting one of three coarse cyclizability
+    groups (low, mid, high) on the Basu Loop-seq dataset. The base policy is
+    HyenaDNA-tiny initialized from group-conditioned supervised fine-tuning.
+  biological_constraints:
+    - sequences must be 50bp and contain only A/C/G/T
+    - generated libraries must preserve valid 50bp sequence and condition semantics
+  target_objective: |
+    Maximize the balanced low/mid/high in-band rate (maximum 1.0) across the
+    declared predictor panels, while retaining sequence-complexity diagnostics.
+    Structural library validity is a separate qualification contract. This is
+    a computational design objective, not prospective biological validation.
+  goal:
+    kind: maximize
+    name: inband_rate
+    metric: joint_hit
+    aggregation: worst_group
+
+base_models:
+  - id: hyenadna-tiny-sft-group3
+    model: backends/loopseq_rl/outputs/sft_group3_v1
+    role: policy
+    init: sft.completion_only
+    notes: |
+      HyenaDNA-tiny after the mounted 3-epoch group-conditioned SFT (low/mid/high)
+      in the group3_v1 artifact. This is the RL starting
+      policy, not the raw pretrained base. Adds special tokens
+      <CYC_GROUP_LOW|MID|HIGH> (ids 12/13/14). eos_termination_rate is 0.0 and
+      generations are length-capped at 50bp, so RL inherits a valid 50bp policy.
+
+data:
+  unified_parquet: backends/loopseq_rl/data/processed/unified_main.parquet
+  split:
+    train: 0.80
+    val:   0.10
+    test:  0.10
+  conditioning_prompts: ["<CYC_GROUP_LOW>", "<CYC_GROUP_MID>", "<CYC_GROUP_HIGH>"]
+  token_alphabet: ACGT
+  success_measurement:
+    groups: [low, mid, high]
+    conditioning_groups:
+      <CYC_GROUP_LOW>: low
+      <CYC_GROUP_MID>: mid
+      <CYC_GROUP_HIGH>: high
+    sequence_length: 50
+    kmer_size: 3
+    online_oracles: [cnn, mixbend, bendnet]
+    training_reference:
+      path: backends/loopseq_rl/data/processed/unified_main.parquet
+      sequence_column: seq50
+      split_column: split
+      split_value: train
+
+oracles:
+  candidate_pool:
+    - id: cnn
+      score_units: z_cyc
+      target_scale: 1.0
+      class: tasks.loopseq.oracles.cnn_ensemble.CNNEnsembleOracle
+      use_for: reward
+      low_mid_boundary: -0.44933514443471667
+      mid_high_boundary: 0.32991884970575086
+      boundary_source: "train-split z_cyc terciles (quantiles 1/3 & 2/3 of unified_main.parquet[split==train], n=137987). NOTE: hits are scored on the CNN output (a shrunk regression-to-mean estimate of z_cyc), so extreme low/high groups are intentionally harder — a disclosed property."
+      held_out_pearson: 0.85
+      notes: Internal CNN ensemble; fastest online oracle (~ms per batch on GPU).
+    - id: mixbend
+      score_units: mixbend_raw_prediction
+      target_scale: 1.0
+      class: tasks.loopseq.oracles.mixbend.MIXBendOracle
+      use_for: spendable_sentinel
+      low_mid_boundary: -0.513096
+      mid_high_boundary: 0.324634
+      boundary_source: frozen oracle audit; train-split adjacent-group median midpoints
+      notes: |
+        DNABERT-6 bimodal ensemble; reward-eligible and fast enough to run on every
+        RL step.
+      self_validation_notes: |
+        Starts HELD OUT and is scored every iteration, so you can see what it says.
+        It is SPENDABLE: you may move it into enabled_oracles, once, permanently.
+        MIXBend and BendNet both showed useful positive-control detection signal;
+        their uncertainty intervals overlap, so the metadata does not rank them.
+    - id: bendnet
+      score_units: bendnet_raw_prediction
+      target_scale: 1.0
+      class: tasks.loopseq.oracles.bendnet.BendNetOracle
+      use_for: sentinel
+      low_mid_boundary: -0.507762
+      mid_high_boundary: 0.224096
+      boundary_source: frozen oracle audit; train-split adjacent-group median midpoints
+      notes: |
+        Compact Keras CNN trained on bendability data. Prespecified as the required
+        detector that cannot enter the reward, ensuring one computational measurement
+        remains unoptimized after any spend. MIXBend and BendNet both showed useful
+        positive-control detection signal; their uncertainty intervals overlap.
+    - id: dnacycp2
+      class: tasks.loopseq.oracles.dnacycp2.DNAcycP2Oracle
+      use_for: audit
+      low_mid_boundary: -0.375923
+      mid_high_boundary: 0.403352
+      boundary_source: frozen oracle audit; train-split adjacent-group median midpoints
+      notes: |
+        Subprocess (~30s/batch); framework-owned blind evaluator in the primary
+        fold and scored only after the outer loop is terminal.
+
+self_validation:
+  primary_fold:
+    # cnn and mixbend are fast enough for inner-loop reward scoring.
+    reward_oracles: [cnn, mixbend]
+    # mixbend starts held out but may be spent; bendnet must remain unoptimized.
+    held_out_oracles: [bendnet, mixbend]
+    required_held_out_oracles: [bendnet]
+    # dnacycp2 is slow and is terminal-only.
+    audit_oracles: [dnacycp2]
+  exploratory_all_online_fold:
+    reward_oracles: [cnn]
+    held_out_oracles: [mixbend, bendnet, dnacycp2]
+    required_held_out_oracles: [mixbend, bendnet, dnacycp2]
+    audit_oracles: []
+  calibration_scope: frozen_train_split
+  limitation: within-lineage cross-model monitoring; not independent validation
+
+framework:
+  terminal_eligibility:
+    rule_id: complete_evidence_advisory_flags_v2
+    required_monitors: []
+    required_strata: [low, mid, high]
+  iteration_budget: 8
+  critic_max_revisions: 3
+
+success:
+  requirements:
+    - {id: raw_legal, metric: legal_ratio, strata: [low, mid, high], minimum: 1.0, min_count: 128}
+    - {id: condition_validity, metric: condition_valid_ratio, strata: [all], minimum: 1.0, min_count: 384}
+    - {id: group_balance, metric: group_balance_ratio, strata: [all], minimum: 1.0, min_count: 384}
+    - {id: delivery_size, metric: generated_count, strata: [low, mid, high], minimum: 128, maximum: 128, min_count: 1}
+  ranking:
+    - {metric: oracle_hit/cnn, strata: [low, mid, high], direction: maximize, reduction: min, tolerance: 0.0}
+  stop_when_qualified: false
+  metric_sources:
+    legal_ratio: []
+    condition_valid_ratio: []
+    group_balance_ratio: []
+    generated_count: []
+    oracle_hit/cnn: [cnn]
+
+# Agent permissions; task targets and requirements are derived from this contract.
+recipe_capabilities:
+  # `transforms` and `shape` are deliberately absent: they stay frozen at the
+  # initial recipe's values.
+  allowed_reward_fields:
+    - enabled_oracles
+    - held_out_oracles
+    - target_objectives
+    - oracle_utilities
+    - aggregator
+    - penalties
+    - gates
+  editable_hyperparameters:
+    lr: {type: number, minimum: 1.0e-06, maximum: 0.0005}
+    kl: {type: number, minimum: 0.001, maximum: 0.2}
+    group_size: {type: integer, enum: [32]}
+    # Task-specific depth bounds; paired protocols declare affordable choices separately.
+    steps: {type: integer, minimum: 4000, maximum: 64000}
+    # All three groups must be declared, each oversampled 1-3x.
+    condition_repeats:
+      type: object
+      properties:
+        '0': {type: integer, minimum: 1, maximum: 3}
+        '1': {type: integer, minimum: 1, maximum: 3}
+        '2': {type: integer, minimum: 1, maximum: 3}
+      required: ['0', '1', '2']
+      additionalProperties: false
+  # loopseq_reference_quality comes from tasks.loopseq.reward; at_homopoly and
+  # the gates come from the shared DNA primitives.
+  allowed_primitives:
+    - [cross_oracle_aggregation, trimmed_mean]
+    - [per_sequence_penalty, at_homopoly]
+    - [hard_biological_gate, gc_bounds_gate]
+    - [hard_biological_gate, homopolymer_gate]
+    - [hard_biological_gate, dinucleotide_entropy_gate]
+    - [per_sequence_penalty, loopseq_reference_quality]
+  frozen_requirements: {}
+  frozen_target_objectives: {}
+  frozen_hyperparameters: {}
+  runtime_parameters: {}
+  allow_primitive_requests: true
+  synthesizable_roles:
+    - per_oracle_utility
+    - cross_oracle_aggregation
+    - per_sequence_penalty
+    - hard_biological_gate

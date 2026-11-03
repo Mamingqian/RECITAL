@@ -1,0 +1,48 @@
+# The packages the repository imports, at the versions the code was run with, plus sentencepiece, which transformers
+# loads for the ProtT5 tokenizer.
+#
+#   conda env create -f environment.yml
+#   conda activate recital
+#   pip install -e . --no-deps
+#
+# The PyTorch wheels come from the CUDA 12.4 index. Python 3.11, torch 2.6.x and transformers 4.57.3 are required:
+# training loads checkpoints through transformers' safe loader, which needs torch >= 2.6.
+# The external models (HyenaDNA, Malinois, ChromBPNet, DNAcycP2, MIXBend, BendNet, PoET-2, enformer-pytorch) are
+# installed separately, see README.md.
+name: recital
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      # training and generation
+      - torch==2.6.0+cu124
+      - transformers==4.57.3
+      - trl==0.26.2
+      - accelerate==1.9.0
+      - datasets==4.4.1
+      - safetensors==0.5.3
+      - tokenizers==0.22.2
+      - huggingface-hub==0.34.3
+      - sentencepiece==0.2.2
+      # agent transport and schemas
+      - openai==2.38.0
+      - httpx==0.28.1
+      - pydantic==2.12.5
+      - jsonschema==4.25.0
+      - tiktoken==0.14.0
+      - PyYAML==6.0.3
+      # data
+      - numpy==2.0.1
+      - pandas==3.0.1
+      - pyarrow==23.0.1
+      - scipy==1.15.2
+      - scikit-learn==1.8.0
+      - joblib==1.5.1
+      - rapidfuzz==3.14.3
+      - biopython==1.85
+      # tests and lint
+      - pytest==9.0.2
+      - ruff==0.15.21

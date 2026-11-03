@@ -1,0 +1,122 @@
+task_family: cre
+contract_path: configs/cre_contract.yaml
+# fp32: bf16 is emulated rather than native below compute capability 8.0, and
+# torch.cuda.is_bf16_supported() answers True there, so nothing catches this except the explicit declaration:
+# training.policy_precision.resolve_bf16 refuses the default rather than downgrading it silently. Declare bf16 for
+# GPUs of compute capability 8.0 or higher.
+training_precision: fp32
+initial_spec_path: configs/cre_initial_spec.json
+protocol_condition: no_self_validation
+seed: 0
+# Eighteen candidates at the declared default of 1500 updates each. A candidate that trains deeper leaves
+# fewer updates for the rounds after it, which is the trade the search is asked to make.
+total_updates: 27000
+initial_schedule_horizon: 6000
+# Bounds the TRAINING levers and leaves the reward levers -- oracles, gates, penalties,
+# transforms, aggregator -- entirely free. The contract's own lever_families text separates
+# the two families and warns that "reaching for lr or kl to fix a composition problem removes
+# the optimization along with it"; the bounds below are what keeps a training lever from being
+# thrown.
+hyperparameter_bounds:
+  lr:
+    type: number
+    # The ceiling is the initial recipe's own lr (5e-5): the agent can lower it down to the
+    # floor and cannot raise it.
+    minimum: 0.00002
+    maximum: 0.00005
+  kl:
+    type: number
+    # A guardrail on the lever, not the mechanism that keeps a collapsed library out of a delivery: that is the library
+    # health requirement. At kl <= 0.0025 the trained libraries lose diversity and fail it, so the floor refuses those
+    # values. A kl of 0.005 stays allowed; the health requirement decides those.
+    minimum: 0.005
+    maximum: 0.02
+online_generation:
+  count: 512
+  count_scope: per_condition
+  temperature: 1.0
+  top_p: 1.0
+  batch_size: 64
+delivery:
+  count: 128
+  count_scope: per_condition
+blind_report:
+  primary_source: chrombpnet
+  metric: raw_target_minus_declared_offtarget
+  oracle_columns: [K562, HepG2, SK-N-SH]
+  off_target_cells_by_target:
+    K562: [HepG2]
+    HepG2: [K562]
+  within_condition: median
+  across_conditions: minimum
+  incomplete_scores: report_incomplete_with_original_denominator
+
+control:
+  proposals:
+    candidates_per_round: 3
+    candidate_budget: 18
+    rounds_min: 4
+    rounds_max: 6
+    anchor_candidate: true
+    max_decision_attempts: 3
+    max_skipped_rounds: 1
+  budget:
+    steps: {min: 500, default: 1500, max: 3000}
+  # How a delivered library is chosen from a candidate's pool. The rule reads only measurements the agent can see.
+  # Rows are taken in rank order. The diversity floor is not declared here: `health` below derives it from the
+  # baseline pool when the baseline is ingested.
+  selection:
+    visible_only: true
+    plan:
+      aggregation: single
+      components:
+        - {measurement: mingap/malinois}
+      count: {K562: 128, HepG2: 128}
+      strata: [K562, HepG2]
+      filters:
+        - {measurement: legal, minimum: 1}
+      deduplication: exact
+      exclude_training_copies: true
+      missing: error
+  # Library health, relative to the baseline (initial-policy) pool, so
+  # it carries no alphabet or length. A row closer than min_distance_fraction x the baseline pool's median
+  # nearest-neighbour normalized edit distance to one already chosen for its condition is skipped, and a
+  # condition whose pool cannot supply 128 rows that far apart delivers fewer and is unqualified: selection never
+  # lowers the floor to fill the count. A selected library whose mean pairwise normalized edit distance is below
+  # min_pairwise_ratio x the baseline pool's is unqualified. The CRE baseline pool has a nearest-neighbour median of
+  # 0.48 and a mean pairwise distance of 0.56.
+  health:
+    min_distance_fraction: 0.10
+    min_pairwise_ratio: 0.20
+  stop:
+    require_assignment_qualified: true
+    min_updates_fraction: 0.0
+  # `cre_cell_gap`: a source's per-row measurement is its raw MinGap, named mingap/<source>.
+  selfval:
+    scalar: cre_cell_gap
+  synthesis:
+    enabled: true
+    roles: [per_oracle_utility, cross_oracle_aggregation, per_sequence_penalty, hard_biological_gate]
+    max_requests: 4
+    attempts_per_request: 3
+llm:
+  model: gpt-6-luna
+  max_prompt_tokens: 60000
+  max_output_tokens: 16000
+  tool_calls_per_decision: 4
+  max_total_tokens: 2000000
+  pricing_usd_per_mtok: {input: null, cached: null, output: null}
+scheduler:
+  # Every candidate of a round can be submitted at once. The job gate counts a Slurm-pending job as live, so a
+  # lower cap holds slots with queued jobs.
+  max_concurrent_jobs: 18
+  # A Slurm partition of your cluster (a comma-separated list is allowed) and the GPUs per job.
+  partition: gpu
+  gres: "gpu:1"
+  # Per-job request. A CRE job uses 1.0-1.2 cores of CPU time per wall hour and at most 2.9 GB of memory; small
+  # requests keep jobs from waiting behind nodes whose GPUs are free and whose cores or memory are not.
+  cpus: 2
+  mem: 4G
+  time_factor: 1.6
+  max_infra_retries: 2
+  poll_seconds: 60

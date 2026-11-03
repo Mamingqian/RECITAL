@@ -1,0 +1,31 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.cache/
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+*.key
+
+# External assets and run directories
+backends/
+runs/
+outputs/
+wandb/
+slurm-*.out
+slurm-*.err
+*.ckpt
+*.safetensors
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
+*~

@@ -1,0 +1,37 @@
+{
+  "enabled_oracles": [
+    "malinois"
+  ],
+  "held_out_oracles": [
+    "enformer_mpra",
+    "agarwal",
+    "grammar_prior"
+  ],
+  "reward_input": {
+    "name": "cell_gap"
+  },
+  "oracle_utilities": {
+    "malinois": {
+      "name": "gap_ema_zscore",
+      "decay": 0.99,
+      "clip": 3.0
+    }
+  },
+  "transforms": [],
+  "aggregator": null,
+  "shape": null,
+  "penalties": [
+    {
+      "name": "repeated_kmer",
+      "k": 8,
+      "max_copies": 12,
+      "weight": 0.5
+    }
+  ],
+  "gates": [],
+  "hyperparameters": {
+    "lr": 5e-05,
+    "kl": 0.02,
+    "group_size": 16
+  }
+}
