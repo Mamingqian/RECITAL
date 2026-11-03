@@ -7,7 +7,7 @@ Coder agent can write new reward components that run in a sandbox. Every prompt,
 library is recorded in a hash-chained event log. Three task families share the engine: Loop-seq DNA cyclizability,
 cell-type-specific enhancers (CRE) and chorismate mutase (CM).
 
-Paper: *Agentic Adaptation of Rewards and Training for Biological Sequence Design* (RECOMB 2027).
+Paper: *Agentic Adaptation of Rewards and Training for Biological Sequence Design* (manuscript to be submitted).
 Code: <https://github.com/Mamingqian/RECITAL>, released under the Apache License 2.0 (`LICENSE`).
 
 This repository holds the framework, the prompts of the Strategist, Critic and Coder, the recipe schema, the reward
