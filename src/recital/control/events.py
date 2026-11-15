@@ -6,9 +6,10 @@ model to and from that `(type, data)` pair, where `data` omits `type`.
 """
 from __future__ import annotations
 
+import importlib
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, ValidationError, model_serializer
 
 from recital.control.errors import LedgerCorruption
 
@@ -108,12 +109,12 @@ class _Event(_Model):
 EVENT_TYPES: dict[str, type[_Event]] = {}
 
 
-def _register(cls: type[_Event]) -> type[_Event]:
+def register(cls: type[_Event]) -> type[_Event]:
     EVENT_TYPES[cls.model_fields["type"].default] = cls
     return cls
 
 
-@_register
+@register
 class RunStarted(_Event):
     """Provenance only: hashes and options are recorded and never compared."""
 
@@ -134,7 +135,7 @@ class RunStarted(_Event):
     llm: dict[str, Any]
 
 
-@_register
+@register
 class JobSubmitIntent(_Event):
     type: Literal["job_submit_intent"] = "job_submit_intent"
     target: str
@@ -144,7 +145,7 @@ class JobSubmitIntent(_Event):
     spec_sha: Sha
 
 
-@_register
+@register
 class JobSubmitted(_Event):
     type: Literal["job_submitted"] = "job_submitted"
     target: str
@@ -153,25 +154,39 @@ class JobSubmitted(_Event):
     slurm_id: str
 
 
-@_register
+@register
 class JobStarted(_Event):
     type: Literal["job_started"] = "job_started"
     target: str
     attempt: Positive
 
 
-@_register
+@register
 class JobAttemptFailed(_Event):
-    """The attempt died for a cluster reason; the target may be submitted again."""
+    """The attempt died for a cluster reason; the target may be submitted again. A `completed_without_result` attempt also
+    carries the log clock's time of the poll that first found the job COMPLETED without its result (`first_look`) and the
+    number of times the result was read again after listing its directory before the attempt was recorded (`rereads`)."""
 
     type: Literal["job_attempt_failed"] = "job_attempt_failed"
     target: str
     attempt: Positive
     cause: str
     slurm_id: str | None
+    first_look: str | None = None
+    rereads: Count | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_reread_fields(self, handler):
+        """An attempt that was not re-read stores the fields the event had before `first_look` and `rereads`, so a log written
+        by this code stays readable by a copy of the code that has no such fields."""
+        data = handler(self)
+        for key in ("first_look", "rereads"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
-@_register
+@register
 class BaselineIngested(_Event):
     type: Literal["baseline_ingested"] = "baseline_ingested"
     attempt: Positive
@@ -180,14 +195,14 @@ class BaselineIngested(_Event):
     n_rows: Count
 
 
-@_register
+@register
 class RoundOpened(_Event):
     type: Literal["round_opened"] = "round_opened"
     round: Positive
     b_effective: Count
 
 
-@_register
+@register
 class DecisionRecorded(_Event, LlmCall):
     """Written before validation, so a paid response is never lost."""
 
@@ -199,7 +214,7 @@ class DecisionRecorded(_Event, LlmCall):
     state_hash: Sha
 
 
-@_register
+@register
 class DecisionValidated(_Event):
     type: Literal["decision_validated"] = "decision_validated"
     decision_id: str
@@ -209,7 +224,7 @@ class DecisionValidated(_Event):
     normalized_sha: Sha | None
 
 
-@_register
+@register
 class CandidatesAllocated(_Event):
     """Every slot of the round appears once, as a candidate or as forfeited."""
 
@@ -220,7 +235,7 @@ class CandidatesAllocated(_Event):
     forfeited_slots: list[Positive]
 
 
-@_register
+@register
 class CandidateCompleted(_Event):
     type: Literal["candidate_completed"] = "candidate_completed"
     candidate: str
@@ -229,14 +244,14 @@ class CandidateCompleted(_Event):
     summary: CandidateSummary
 
 
-@_register
+@register
 class SelfvalComputed(_Event):
     type: Literal["selfval_computed"] = "selfval_computed"
     candidate: str
     selfval_sha: Sha
 
 
-@_register
+@register
 class LedgerRowFrozen(_Event):
     type: Literal["ledger_row_frozen"] = "ledger_row_frozen"
     candidate: str
@@ -244,7 +259,7 @@ class LedgerRowFrozen(_Event):
     tokens: Count
 
 
-@_register
+@register
 class CriticAdvisory(_Event, LlmCall):
     type: Literal["critic_advisory"] = "critic_advisory"
     round: Positive
@@ -252,7 +267,7 @@ class CriticAdvisory(_Event, LlmCall):
     n_concerns: Count
 
 
-@_register
+@register
 class CriticUnavailable(_Event):
     type: Literal["critic_unavailable"] = "critic_unavailable"
     round: Positive
@@ -260,7 +275,7 @@ class CriticUnavailable(_Event):
     cause: str
 
 
-@_register
+@register
 class ComponentRequested(_Event):
     type: Literal["component_requested"] = "component_requested"
     request_id: str
@@ -272,7 +287,7 @@ class ComponentRequested(_Event):
     request_sha: Sha
 
 
-@_register
+@register
 class ComponentAttempt(_Event, LlmCall):
     type: Literal["component_attempt"] = "component_attempt"
     request_id: str
@@ -282,7 +297,7 @@ class ComponentAttempt(_Event, LlmCall):
     detail_sha: Sha | None
 
 
-@_register
+@register
 class ComponentResult(_Event):
     type: Literal["component_result"] = "component_result"
     request_id: str
@@ -292,7 +307,7 @@ class ComponentResult(_Event):
     component_sha: Sha | None
 
 
-@_register
+@register
 class StopRequested(_Event):
     type: Literal["stop_requested"] = "stop_requested"
     round: Positive
@@ -303,7 +318,7 @@ class StopRequested(_Event):
     summary_sha: Sha | None
 
 
-@_register
+@register
 class StopAccepted(_Event):
     type: Literal["stop_accepted"] = "stop_accepted"
     round: Positive
@@ -312,7 +327,7 @@ class StopAccepted(_Event):
     assignment: dict[str, str]
 
 
-@_register
+@register
 class StopRejected(_Event):
     type: Literal["stop_rejected"] = "stop_rejected"
     round: Positive
@@ -321,7 +336,7 @@ class StopRejected(_Event):
     reasons: list[Problem]
 
 
-@_register
+@register
 class DeliveryAssembled(_Event):
     type: Literal["delivery_assembled"] = "delivery_assembled"
     assignment: dict[str, str]
@@ -331,7 +346,7 @@ class DeliveryAssembled(_Event):
     counts: dict[str, Count]
 
 
-@_register
+@register
 class LibraryFrozen(_Event):
     type: Literal["library_frozen"] = "library_frozen"
     status: FinalStatus
@@ -339,7 +354,7 @@ class LibraryFrozen(_Event):
     reason_code: str | None
 
 
-@_register
+@register
 class RunFinished(_Event):
     """`needs_attention` ends the run until a `resumed` event; the others are final."""
 
@@ -348,7 +363,7 @@ class RunFinished(_Event):
     reason_code: str | None
 
 
-@_register
+@register
 class RoundSkipped(_Event):
     type: Literal["round_skipped"] = "round_skipped"
     round: Positive
@@ -356,7 +371,7 @@ class RoundSkipped(_Event):
     reason_code: str
 
 
-@_register
+@register
 class Resumed(_Event):
     """Hashes are recorded for provenance; a difference from the start is not an error."""
 
@@ -368,14 +383,28 @@ class Resumed(_Event):
     oracle_versions_hash: Sha
 
 
-EventModel = Annotated[Union[tuple(EVENT_TYPES.values())], Field(discriminator="type")]
-_ADAPTER = TypeAdapter(EventModel)
+_ADAPTERS: dict[tuple[str, ...], TypeAdapter] = {}
+
+
+def _adapter() -> TypeAdapter:
+    """The union of every registered event type; rebuilt when a module has registered more since the last call."""
+    known = tuple(EVENT_TYPES)
+    if known not in _ADAPTERS:
+        _ADAPTERS[known] = TypeAdapter(Annotated[Union[tuple(EVENT_TYPES.values())], Field(discriminator="type")])
+    return _ADAPTERS[known]
 
 
 def parse_event(raw: dict[str, Any]) -> _Event:
-    """Build the model for a flat `{type, **payload}` mapping."""
+    """Build the model for a flat `{type, **payload}` mapping.
+
+    A module's events are named `<module>.<event>` and register when `recital.control.ext.<module>` is imported, so
+    reading a log that holds one imports its module.
+    """
+    kind = raw.get("type")
+    if isinstance(kind, str) and "." in kind and kind not in EVENT_TYPES:
+        importlib.import_module(f"recital.control.ext.{kind.split('.', 1)[0]}")
     try:
-        return _ADAPTER.validate_python(raw)
+        return _adapter().validate_python(raw)
     except ValidationError as exc:
         raise LedgerCorruption(f"event {raw.get('type')!r} fails its schema: {exc}") from exc
 

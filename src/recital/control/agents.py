@@ -40,6 +40,7 @@ def run_strategist(
     tools: Sequence[ToolSpec],
     execute_tool: ToolExecutor,
     max_tool_calls: int,
+    schema_name: str = "decision",
 ) -> AgentTurn:
     """Let the model retrieve up to `max_tool_calls` times, then require the strict final answer."""
     items = [dict(item) for item in input_items]
@@ -50,7 +51,7 @@ def run_strategist(
         offer = tools if used < max_tool_calls else ()
         try:
             turn = transport.respond(items, instructions=instructions, schema=schema,
-                                     schema_name="decision", tools=offer)
+                                     schema_name=schema_name, tools=offer)
         except ControlError as exc:
             exc.partial_usage = usage + getattr(exc, "usage", Usage())
             raise
@@ -84,9 +85,11 @@ def run_critic(
     instructions: str,
     input_items: Sequence[Mapping[str, Any]],
     schema: Mapping[str, Any],
+    schema_name: str = "review",
 ) -> AgentTurn:
+    """One structured call with no tools; a module's reviewer or analyst turn is this with its own `schema_name`."""
     turn = transport.respond([dict(item) for item in input_items], instructions=instructions,
-                             schema=schema, schema_name="review")
+                             schema=schema, schema_name=schema_name)
     if turn.parsed is None:
         raise ControlError("the critic turn ended without a structured answer")
     return AgentTurn(turn.parsed, (), turn.usage, transport.model, turn.model, turn.latency_s)

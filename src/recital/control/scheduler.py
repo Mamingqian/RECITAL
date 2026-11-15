@@ -74,6 +74,9 @@ class Scheduler(Protocol):
     def find_by_token(self, token: str) -> JobHandle | None:
         """The job submitted under `token`, or None if the scheduler holds none."""
 
+    def cancel(self, handle: JobHandle) -> None:
+        """Ask the scheduler to end the job. A job that already ended is not an error."""
+
 
 _WRAPPER = """
 exit_file=$1; limit=$2; shift 2
@@ -157,6 +160,18 @@ class LocalScheduler:
             if record["token"] == token:
                 return JobHandle("local", str(record["pid"]), token, record["spec_path"])
         return None
+
+    def cancel(self, handle: JobHandle) -> None:
+        """SIGTERM to the job's process group (the job is its own session leader); a job that is gone is left alone."""
+        try:
+            record = json.loads(self._record_path(Path(handle.spec_path)).read_text())
+        except OSError as exc:
+            raise ControlError(f"no local record of the job submitted under {handle.token}") from exc
+        if record["token"] == handle.token and self._alive(record):
+            try:
+                os.killpg(record["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def _alive(self, record: dict) -> bool:
         child = self._children.get(record["token"])

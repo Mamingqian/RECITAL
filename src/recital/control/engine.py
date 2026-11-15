@@ -8,9 +8,11 @@ event after, and all state a decision needs comes from events and the blobs they
 from __future__ import annotations
 
 import json
+import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -28,12 +30,12 @@ from .guard import count_tokens
 from .health import UNIQUE_KMER_MEASUREMENT, HealthRule, baseline_reference, diversity_floor, plan_with_floor
 from .jobs import (BASELINE_ACTION_ID, BASELINE_RESULT_NAME, CANDIDATE_RESULT_NAME, BaselineResult, Candidate,
                    CandidateResult, CheckpointRecord, Evaluation, JobSpec, Resources, TrainParameters,
-                   file_sha256, read_failure, read_result, read_spec, write_json, write_spec)
+                   file_sha256, read_failure, read_result, read_result_listed, read_spec, write_json, write_spec)
 from .jsonio import canonical_json, sha256_hex
 from .ledger import build_row, composition_bands, medians, render_row, visible_row
 from .projection import ArmView, Retriever, evidence_of, render, render_with_tail
 from .prompts import CRITIC_SYSTEM
-from .schemas import critic_schema, retrieval_tools, round_response_schema
+from .schemas import assert_strict_compatible, critic_schema, retrieval_tools, round_response_schema
 from .scheduler import JobState, Scheduler
 from .selection import best_assignment, validate_assignment, validate_no_qualified
 from .selfval import scalar_name
@@ -43,6 +45,8 @@ from .transport import (ResponseIncomplete, ResponseRefused, ResponsesTransport,
                         TransportUnavailable, Usage as TransportUsage, UsageMeter)
 
 BASELINE = "baseline"
+# The order `Engine.step` tries them in; a module's phase runs right after the core phase it names (`ext.Phase.after`).
+PHASES = ("baseline", "jobs", "selfval", "rows", "finish", "submit", "critic", "decide")
 TRAIN_SECONDS_PER_STEP = 2.6
 FIXED_JOB_SECONDS = 2400
 TIMEOUT_GROWTH = 1.5
@@ -50,6 +54,10 @@ TIMEOUT_GROWTH = 1.5
 # many in a row without making progress stops for a person instead of waiting forever.
 TRANSIENT = (OSError, TransportUnavailable, ResponseIncomplete, ResponseUnparsable, ResponseRefused)
 TRANSIENT_LIMIT = 6
+# Seconds waited before each re-read of the result of a job Slurm reports COMPLETED when none of its own attempt is
+# visible; every re-read lists the directory first. Three re-reads over ten seconds, then the attempt is recorded failed.
+RESULT_REREAD_DELAYS = (0.0, 3.0, 7.0)
+_logger = logging.getLogger(__name__)
 
 
 class StepResult(str, Enum):
@@ -81,9 +89,10 @@ class EngineSettings:
     # Names admitted per role, or a callable that reads them from the live catalog each round.
     primitives: Mapping[str, Sequence[str]] | Callable[[], Mapping[str, Sequence[str]]]
     approved_references: Sequence[str] = ()
+    extensions: Sequence[Any] = ()         # ext.Extension, built from `control.modules`
 
 
-def _llm_fields(turn: AgentTurn, rendered, schema_sha: str, response_sha: str, transcript_sha: str | None):
+def llm_fields(turn: AgentTurn, rendered, schema_sha: str, response_sha: str, transcript_sha: str | None):
     usage = turn.usage
     return dict(
         prompt_hash=rendered.prompt_hash, prompt_manifest=list(rendered.manifest), schema_sha=schema_sha,
@@ -112,7 +121,12 @@ class Engine:
         control = settings.control
         if control.synthesis.enabled and components is None:
             raise ControlError("synthesis is enabled but no component runner is mounted")
-        self.arm = ArmView.from_task(settings.task)
+        self.extensions = tuple(settings.extensions)
+        for extension in self.extensions:
+            unknown = [phase.name for phase in extension.phases() if phase.after not in PHASES]
+            if unknown:
+                raise ControlError(f"module {extension.name!r} has phases {unknown} after no core phase of {PHASES}")
+        self.arm = ArmView.from_task(settings.task, checks_text=control.checks_text)
         self.visible = sorted(settings.task.visible_sources)
         self.headline = [scalar_name(control.selfval.scalar, source) for source in self.visible]
         self.meter = UsageMeter(control.llm.max_total_tokens)
@@ -172,8 +186,7 @@ class Engine:
             self.emit(self.s.run_header)
             return StepResult.PROGRESS
         try:
-            for phase in (self._baseline, self._jobs, self._selfval, self._rows, self._finish, self._submit,
-                          self._critic, self._decide):
+            for phase in self._phases():
                 if phase(state):
                     self._transient = 0
                     return StepResult.PROGRESS
@@ -187,6 +200,14 @@ class Engine:
             return StepResult.DONE
         self._transient = 0
         return StepResult.DONE if self.state().terminal else StepResult.WAITING
+
+    def _phases(self) -> list[Callable[[RunState], bool]]:
+        phases: list[Callable[[RunState], bool]] = []
+        for name in PHASES:
+            phases.append(getattr(self, f"_{name}"))
+            for extension in self.extensions:
+                phases.extend(partial(phase.run, self) for phase in extension.phases() if phase.after == name)
+        return phases
 
     def _halt(self, exc: Exception) -> None:
         write_json(self.s.run_dir / "needs_attention.json", {"type": type(exc).__name__, "message": str(exc)})
@@ -250,12 +271,12 @@ class Engine:
         records = {"initial": self._initial_record()}
         for candidate in state.ordered_candidates():
             if candidate.status == "ok":
-                result = self._result(candidate.id)
+                result = self.result(candidate.id)
                 for record in result.checkpoints:
                     records[record.id] = record
         return records
 
-    def _result(self, candidate: str) -> CandidateResult:
+    def result(self, candidate: str) -> CandidateResult:
         if candidate not in self._results:
             path = self.candidate_dir(candidate) / CANDIDATE_RESULT_NAME
             self._results[candidate] = CandidateResult.model_validate(json.loads(path.read_text()))
@@ -358,12 +379,9 @@ class Engine:
         except SchedulerUnreachable:
             return False
         output = self._output_dir(target)
-        result = read_result(output)
-        if result is not None and result.attempt == attempt and result.submit_token == token:
-            if result.status == "ok":
-                return self._ingest(state, target, attempt)
-            failure = read_failure(output) or result.failure
-            return self._failed(state, target, job, attempt, failure.type, failure.message, failure.retryable)
+        settled = self._settle(state, target, job, attempt, token, read_result(output), output)
+        if settled is not None:
+            return settled
         if status is None:
             return self._failed(state, target, job, attempt, "job_vanished", "the scheduler holds no such job", True)
         if status.state is JobState.RUNNING:
@@ -372,8 +390,7 @@ class Engine:
                 return True
             return False
         if status.state is JobState.COMPLETED:
-            return self._failed(state, target, job, attempt, "completed_without_result",
-                                "the job exited cleanly without a result marker", True)
+            return self._completed_without_result(state, target, job, attempt, token, output)
         if status.state in (JobState.FAILED, JobState.CANCELLED):
             # An out-of-memory kill repeats under the same request, so it is the recipe's failure, not the cluster's.
             return self._failed(state, target, job, attempt, status.reason or status.state.value,
@@ -383,16 +400,46 @@ class Engine:
             return self._failed(state, target, job, attempt, "timeout", "the job hit its time limit", True)
         return False
 
+    def _settle(self, state: RunState, target: str, job, attempt: int, token: str, result, output: Path) -> bool | None:
+        """Act on the result of this attempt, or return None when `result` is missing or belongs to another attempt."""
+        if result is None or result.attempt != attempt or result.submit_token != token:
+            return None
+        if result.status == "ok":
+            return self._ingest(state, target, attempt)
+        failure = read_failure(output) or result.failure
+        return self._failed(state, target, job, attempt, failure.type, failure.message, failure.retryable)
+
+    def _completed_without_result(self, state: RunState, target: str, job, attempt: int, token: str, output: Path) -> bool:
+        """Slurm says COMPLETED and no result of this attempt is visible: read it again, listing the directory first, over
+        `RESULT_REREAD_DELAYS` before recording the attempt failed. The record keeps the time of the first look and the
+        number of re-reads; a result that shows up on a re-read is ingested as if the first look had seen it."""
+        first_look = self.log.now()
+        for rereads, delay in enumerate(RESULT_REREAD_DELAYS, start=1):
+            if delay:
+                self.sleep(delay)
+            settled = self._settle(state, target, job, attempt, token, read_result_listed(output), output)
+            if settled is not None:
+                _logger.warning("%s attempt %d: result visible on re-read %d after the first look at %s", target, attempt,
+                                rereads, first_look)
+                return settled
+        return self._failed(state, target, job, attempt, "completed_without_result",
+                            "the job exited cleanly without a result marker", True,
+                            first_look=first_look, rereads=len(RESULT_REREAD_DELAYS))
+
     def _failed(self, state: RunState, target: str, job, attempt: int, cause: str, message: str,
-                retryable: bool) -> bool:
+                retryable: bool, *, first_look: str | None = None, rereads: int | None = None) -> bool:
+        attempt_failed = partial(ev.JobAttemptFailed, target=target, attempt=attempt, cause=cause[:120],
+                                 slurm_id=job.slurm_id, first_look=first_look, rereads=rereads)
         if retryable and len(job.infra_failures) < self.s.control.scheduler.max_infra_retries:
-            self.emit(ev.JobAttemptFailed(target=target, attempt=attempt, cause=cause[:120], slurm_id=job.slurm_id))
+            self.emit(attempt_failed())
             return True
         if target == BASELINE:
             # Return the baseline to pending first, so a resume submits it again instead of polling the dead job.
-            self.emit(ev.JobAttemptFailed(target=target, attempt=attempt, cause=cause[:120], slurm_id=job.slurm_id))
+            self.emit(attempt_failed())
             raise ControlError(f"the baseline job failed: {cause}: {message}")
         detail = {"type": cause, "message": message}
+        if first_look is not None:
+            detail.update(first_look=first_look, rereads=rereads)
         failure_sha = self.blobs.put_json(detail)
         status = "timeout" if cause == "timeout" else "failed"
         self.emit(ev.CandidateCompleted(candidate=target, attempt=attempt, status=status,
@@ -406,7 +453,7 @@ class Engine:
             self.emit(ev.BaselineIngested(attempt=attempt, pool_sha=result.pool_sha256,
                                           policy_sample_sha=result.policy_sample_sha256, n_rows=result.n_rows))
             return True
-        result = self._result(target)
+        result = self.result(target)
         self.emit(ev.CandidateCompleted(candidate=target, attempt=attempt, status="ok",
                                         summary=ev.CandidateSummary(**result.summary.model_dump())))
         return True
@@ -446,14 +493,18 @@ class Engine:
             if not ok:
                 failure = self.blobs.get_json(candidate.completed.failure_sha) if candidate.completed.failure_sha \
                     else {"type": candidate.status, "message": ""}
+            result = self.result(name).model_dump() if ok else None
             row = build_row(
                 candidate={"id": name, "round": candidate.round, "slot": candidate.slot, "parent": parent,
                            "start": candidate.start, "repeat_of": candidate.repeat_of, "anchor": candidate.anchor,
                            "status": candidate.status},
                 spec=spec, parent_recipe=parent_recipe, parent_row=parent_row,
                 baseline_pool=self._baseline_medians(), baseline_bands=self._baseline_bands(),
-                result=self._result(name).model_dump() if ok else None,
-                failure=failure, conditions=list(self.s.task.conditions), headline=self.headline)
+                result=result, failure=failure, conditions=list(self.s.task.conditions), headline=self.headline)
+            added = {extension.name: fields for extension in self.extensions
+                     if (fields := extension.row_fields(self, state, name, spec, result)) is not None}
+            if added:
+                row["ext"] = added
             tokens = count_tokens(render_row(visible_row(row)))
             self.emit(ev.LedgerRowFrozen(candidate=name, row_sha=self.blobs.put_json(row), tokens=tokens))
             progressed = True
@@ -479,7 +530,8 @@ class Engine:
             try:
                 rendered = render_with_tail(state, self.blobs, arm=self.arm, header=self.s.header_text,
                                             instructions=CRITIC_SYSTEM, tail=tail,
-                                            limit=self.s.control.llm.max_prompt_tokens, schema=schema, tools=())
+                                            limit=self.s.control.llm.max_prompt_tokens, schema=schema, tools=(),
+                                            extensions=self.extensions)
                 turn = run_critic(self.transport, instructions=rendered.instructions,
                                   input_items=rendered.input_items, schema=schema)
             except (BlindingViolation, PromptBudgetExceeded, RunTokenBudgetExceeded, LedgerCorruption):
@@ -492,14 +544,14 @@ class Engine:
                    "rationale": turn.parsed["rationale"]}
             self.emit(ev.CriticAdvisory(
                 round=rnd.index, row_sha=self.blobs.put_json(row), n_concerns=len(row["concerns"]),
-                **_llm_fields(turn, rendered, self.blobs.put_json(schema), self.blobs.put_json(turn.parsed), None)))
-            self._count(turn)
+                **llm_fields(turn, rendered, self.blobs.put_json(schema), self.blobs.put_json(turn.parsed), None)))
+            self.count(turn)
             return True
         self.emit(ev.CriticUnavailable(round=rnd.index, attempts=2,
                                        cause=f"{type(failure).__name__}: {failure}"[:200]))
         return True
 
-    def _count(self, turn: AgentTurn) -> None:
+    def count(self, turn: AgentTurn) -> None:
         self.meter.add(turn.usage)
 
     # ----- decisions ------------------------------------------------------------------------------
@@ -512,9 +564,26 @@ class Engine:
             return 0
         return min(state.B, fits)
 
-    def _agent_count(self, round_index: int, b_effective: int) -> int:
-        anchor = self.s.control.proposals.anchor_candidate and round_index == 1
-        return b_effective - 1 if anchor else b_effective
+    def _engine_proposals(self, state: RunState, rnd) -> list[dict[str, Any]]:
+        """The proposals the modules submit themselves in `rnd`, none in a round that proposes nothing."""
+        if rnd.b_effective == 0:
+            return []
+        return [dict(proposal) for extension in self.extensions for proposal in extension.engine_proposals(state, rnd)]
+
+    def _agent_count(self, state: RunState, rnd) -> int:
+        """The candidates the Strategist proposes in `rnd`: its slots less the anchor and the modules' own proposals."""
+        anchor = self.s.control.proposals.anchor_candidate and rnd.index == 1
+        return rnd.b_effective - (1 if anchor else 0) - len(self._engine_proposals(state, rnd))
+
+    def _stage_steps(self, state: RunState, rnd, entry: Mapping[str, Any]) -> int | None:
+        """The updates a module has a candidate train in this stage, fewer than its plan; None when none does."""
+        stages = [stage for extension in self.extensions
+                  if (stage := extension.stage_steps(self, state, rnd, entry)) is not None]
+        if not stages:
+            return None
+        if min(stages) < 1:
+            raise ControlError(f"a module's stage of {min(stages)} updates is not a positive number")
+        return min(stages)
 
     def _decide(self, state: RunState) -> bool:
         if state.stop.accepted is not None or state.baseline.status != "ingested":
@@ -528,7 +597,11 @@ class Engine:
             self.emit(ev.StopAccepted(round=pending.round, source=pending.source, outcome=pending.outcome,
                                       assignment=pending.assignment))
             return True
+        if any(extension.holds(self, state) for extension in self.extensions):
+            return False
         for decision_id in state.decisions_awaiting_validation:
+            if any(extension.prepare_validation(self, state, decision_id) for extension in self.extensions):
+                return True
             self._validate_recorded(state, decision_id)
             return True
         for decision_id in state.decisions_awaiting_action:
@@ -560,15 +633,49 @@ class Engine:
         allow_components = (synthesis.enabled and rnd.b_effective > 0
                             and len(state.components) < synthesis.max_requests)
         primitives = self.s.primitives() if callable(self.s.primitives) else self.s.primitives
-        return round_response_schema(
+        extra = self._extra_candidate_fields()
+        schema = round_response_schema(
             conditions=list(self.s.task.conditions), reward_oracles=sorted(ctx.reward_eligible),
             aggregators=primitives.get("cross_oracle_aggregation", ()),
             utilities=primitives.get("per_oracle_utility", ()), penalties=primitives.get("per_sequence_penalty", ()),
             gates=primitives.get("hard_biological_gate", ()),
-            max_candidates=max(self._agent_count(rnd.index, rnd.b_effective) - len(self._kept(state, rnd)), 0),
+            max_candidates=max(self._agent_count(state, rnd) - len(self._kept(state, rnd)), 0),
             stop_only=rnd.b_effective == 0,
             synthesis_roles=list(synthesis.roles) if allow_components else None,
-            approved_references=list(self.s.approved_references), aggregator_form=ctx.initial_recipe.get("aggregator"))
+            approved_references=list(self.s.approved_references), aggregator_form=ctx.initial_recipe.get("aggregator"),
+            levers=self._round_levers(state, rnd), extra_candidate_fields=extra or None)
+        if extra:
+            try:
+                assert_strict_compatible(schema)
+            except ValueError as exc:
+                raise ControlError(f"a module's candidate fields leave the strict schema subset: {exc}") from exc
+        return schema
+
+    def _round_levers(self, state: RunState, rnd) -> tuple[str, ...]:
+        """The levers open in this round: the contract's, narrowed by every module that has an opinion."""
+        levers = tuple(self.s.control.levers)
+        for extension in self.extensions:
+            narrowed = extension.open_levers(state, rnd)
+            if narrowed is not None:
+                levers = tuple(lever for lever in levers if lever in narrowed)
+        if not levers:
+            raise ControlError(f"no lever is open in round {rnd.index}")
+        return levers
+
+    def _round_ctx(self, state: RunState, rnd) -> rc.RecipeContext:
+        levers = self._round_levers(state, rnd)
+        ctx = self.s.recipe_ctx
+        return ctx if levers == tuple(ctx.levers) else replace(ctx, levers=levers)
+
+    def _extra_candidate_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        for extension in self.extensions:
+            added = dict(extension.candidate_fields(self))
+            twice = sorted(set(added) & set(fields))
+            if twice:
+                raise ControlError(f"module {extension.name!r} adds the candidate fields {twice}, which another module adds")
+            fields.update(added)
+        return fields
 
     def _accepted(self, state: RunState, rnd, *, before: str | None = None) -> tuple[str, dict[str, Any]] | None:
         """The newest propose answer of this round before `before` (default: every answer), with what it accepted.
@@ -590,19 +697,24 @@ class Engine:
         for the slots still open; when the attempts run out the round allocates them."""
         accepted = self._accepted(state, rnd, before=before)
         return [] if accepted is None else [entry for entry in accepted[1]["entries"]
-                                            if not entry["resolved"]["anchor"]]
+                                            if not entry["resolved"]["anchor"] and entry.get("source") != "engine"]
 
-    def _ask(self, state: RunState, rnd) -> None:
+    def ask_prompt(self, state: RunState, rnd):
+        """What the Strategist is shown and may answer in `rnd`: the rendered request, the response schema, the tools."""
         schema = self._round_schema(state, rnd)
         tools = retrieval_tools(list(self.s.task.conditions), self.headline)
         kept = self._kept(state, rnd)
         rendered = render(state, self.blobs, arm=self.arm, header=self.s.header_text,
                           instructions=self.s.instructions, control=self.s.control, success=self.s.success,
                           conditions=list(self.s.task.conditions), stop_only=rnd.b_effective == 0,
-                          b_effective=self._agent_count(rnd.index, rnd.b_effective) - len(kept), schema=schema,
+                          b_effective=self._agent_count(state, rnd) - len(kept), schema=schema,
                           tools=tools, kept=[f"slot {entry['slot']} (parent {entry['resolved']['parent']}, "
                                              f"{entry['resolved']['start']}, {entry['resolved']['steps']} steps)"
-                                             for entry in kept])
+                                             for entry in kept], extensions=self.extensions)
+        return rendered, schema, tools
+
+    def _ask(self, state: RunState, rnd) -> None:
+        rendered, schema, tools = self.ask_prompt(state, rnd)
         retriever = Retriever(run_dir=self.s.run_dir, state=state, store=self.blobs, arm=self.arm,
                               definitions=self.s.definitions, visible_sources=self.visible,
                               conditions=list(self.s.task.conditions))
@@ -619,9 +731,9 @@ class Engine:
         self.emit(ev.DecisionRecorded(
             decision_id=state.next_decision_id, round=rnd.index, kind=turn.parsed["kind"], attempt=rnd.attempts + 1,
             state_hash=state_hash(state),
-            **_llm_fields(turn, rendered, self.blobs.put_json(schema), self.blobs.put_json(turn.parsed),
+            **llm_fields(turn, rendered, self.blobs.put_json(schema), self.blobs.put_json(turn.parsed),
                           transcript_sha)))
-        self._count(turn)
+        self.count(turn)
 
     # validation ---------------------------------------------------------------------------------
 
@@ -632,8 +744,8 @@ class Engine:
         parents = {"initial": rc.initial_parent_record(self.s.recipe_ctx)}
         for candidate in state.ordered_candidates():
             if candidate.status == "ok":
-                end = next(r for r in self._result(candidate.id).checkpoints
-                           if r.id == self._result(candidate.id).end_checkpoint_id)
+                end = next(r for r in self.result(candidate.id).checkpoints
+                           if r.id == self.result(candidate.id).end_checkpoint_id)
                 parents[candidate.id] = end.model_dump()
         return parents
 
@@ -659,6 +771,7 @@ class Engine:
         if rnd.b_effective == 0:
             return False, 0, [self._problem("propose_not_allowed", "kind", "no further candidates may be proposed")], None
         anchored = 1 if rnd.index == 1 and self.s.control.proposals.anchor_candidate else 0
+        ctx = self._round_ctx(state, rnd)
         parents = self._parents(state)
         history: dict[str, str] = {}
         for candidate in state.ordered_candidates():
@@ -673,21 +786,38 @@ class Engine:
                 raise ControlError("the declared initial recipe does not resolve: "
                                    + "; ".join(f"{p.code} {p.detail}" for p in anchor_problems))
             entries.append({"slot": 1, "proposal": rc.anchor_proposal(), "resolved": _resolved_dict(anchor_resolved)})
+        # The modules' own proposals follow the anchor, as the anchor is resolved: a failure is a module's, not the Strategist's.
+        fixed = anchored
+        for proposal in self._engine_proposals(state, rnd):
+            item, found = rc.resolve(proposal, self.s.recipe_ctx, parents, committed_updates=state.committed_updates,
+                                     siblings=[rc.Resolved(**entry["resolved"]) for entry in entries], history=history)
+            if item is None or found:
+                raise ControlError("a module's own proposal does not resolve: "
+                                   + "; ".join(f"{p.code} {p.detail}" for p in found))
+            entries.append({"slot": len(entries) + 1, "proposal": proposal, "resolved": _resolved_dict(item),
+                            "source": "engine"})
+            fixed += 1
+        if fixed > rnd.b_effective:
+            raise ControlError(f"the modules propose {fixed - anchored} candidates in round {rnd.index}, "
+                               f"which has {rnd.b_effective - anchored} slots after the anchor")
         # Candidates accepted from this round's earlier refused answers occupy their slots and count as siblings.
         entries.extend(self._kept(state, rnd, before=decision.id))
-        expected = self._agent_count(rnd.index, rnd.b_effective) - (len(entries) - anchored)
+        expected = self._agent_count(state, rnd) - (len(entries) - fixed)
         resolved = [rc.Resolved(**entry["resolved"]) for entry in entries]
         proposals = list(parsed["candidates"])
         got = len(proposals)
         if got > expected:
             proposals = []  # more candidates than open slots: none is taken, so no slot number can overflow
         for index, proposal in enumerate(proposals):
-            item, found = rc.resolve(proposal, self.s.recipe_ctx, parents, committed_updates=state.committed_updates,
+            item, found = rc.resolve(proposal, ctx, parents, committed_updates=state.committed_updates,
                                      siblings=resolved, history=history)
-            for problem in found:
+            # A candidate a module refuses is not kept for the retry: its slot is asked again like an unresolved one.
+            refused = [*found, *(problem for extension in self.extensions for problem in
+                                 extension.validate_candidate(self, state, rnd, index, proposal, item))]
+            for problem in refused:
                 problems.append(self._problem(problem.code, f"candidates[{index}].{problem.path}".rstrip("."),
                                               problem.detail))
-            if item is not None:
+            if item is not None and not refused:
                 resolved.append(item)
                 entries.append({"slot": len(resolved), "proposal": proposal, "resolved": _resolved_dict(item)})
         if got != expected:
@@ -696,7 +826,7 @@ class Engine:
         last = rnd.attempts >= self.s.control.proposals.max_decision_attempts
         ok = not problems or (last and len(entries) >= 1)
         # A refused answer records what it got accepted, for the retry to build on.
-        normalized = {"kind": "propose", "entries": entries} if ok or len(entries) > anchored else None
+        normalized = {"kind": "propose", "entries": entries} if ok or len(entries) > fixed else None
         return ok, len(entries), problems, normalized
 
     def _validate_stop(self, state: RunState, rnd, parsed):
@@ -772,14 +902,23 @@ class Engine:
         for entry in normalized["entries"]:
             slot, item, proposal = entry["slot"], entry["resolved"], entry["proposal"]
             used.add(slot)
-            spec_sha = self.blobs.put_json({
-                "recipe": item["recipe"], "train": item["train"], "hypothesis": proposal["hypothesis"],
-                "proposal": proposal, "fingerprint": item["fingerprint"]})
+            train, steps, planned = item["train"], item["steps"], None
+            stage = None if item["anchor"] or entry.get("source") == "engine" else self._stage_steps(state, rnd, entry)
+            if stage is not None and stage < steps:
+                # The stage trains `stage` updates of a plan of `steps`; the schedule keeps the plan's horizon.
+                planned, steps = steps, stage
+                train = {**train, "additional_updates": stage,
+                         "checkpoint_steps": sorted({*range(rc.RECOVERY_INTERVAL, stage, rc.RECOVERY_INTERVAL), stage})}
+            spec = {"recipe": item["recipe"], "train": train, "hypothesis": proposal["hypothesis"],
+                    "proposal": proposal, "fingerprint": item["fingerprint"]}
+            if planned is not None:
+                spec["planned_steps"] = planned
+            spec_sha = self.blobs.put_json(spec)
             ordinal = ordinal_of(rnd.index, slot, state.B)
             candidates.append(ev.AllocatedCandidate(
                 id=candidate_id(ordinal), ordinal=ordinal, slot=slot,
                 parent=None if item["parent"] == "initial" else item["parent"], start=item["start"],
-                recipe_sha=spec_sha, fingerprint=item["fingerprint"], steps=item["steps"],
+                recipe_sha=spec_sha, fingerprint=item["fingerprint"], steps=steps,
                 repeat_of=item["repeat_of"], anchor=item["anchor"]))
         forfeited = [slot for slot in range(1, rnd.b_effective + 1) if slot not in used]
         self.emit(ev.CandidatesAllocated(round=rnd.index, decision_id=decision_id, candidates=candidates,

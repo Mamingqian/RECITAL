@@ -8,7 +8,7 @@ that contradicts an earlier event, raises LedgerCorruption.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -151,6 +151,9 @@ class RunState(_State):
     resumes: int = 0
     terminal: bool = False
     finished_status: str | None = None
+    # What the modules' events fold to, one entry per module. A state no module has written to hashes as it did
+    # before modules existed (`state_hash`), so the field stays out of the dump.
+    ext: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @property
     def header(self) -> ev.RunStarted:
@@ -252,7 +255,7 @@ Handler = Callable[[RunState, Any], None]
 _HANDLERS: dict[str, Handler] = {}
 
 
-def _handles(cls: type[ev._Event]) -> Callable[[Handler], Handler]:
+def handles(cls: type[ev._Event]) -> Callable[[Handler], Handler]:
     def register(handler: Handler) -> Handler:
         _HANDLERS[cls.model_fields["type"].default] = handler
         return handler
@@ -286,26 +289,29 @@ def _decision(state: RunState, decision_id: str, event: ev._Event) -> DecisionSt
     return state.decisions[decision_id]
 
 
-def _spend(state: RunState, call: ev.LlmCall) -> None:
-    used = call.usage
+def add_usage(state: RunState, used: ev.Usage, models: Sequence[str] = ()) -> None:
+    """Charge tokens to the run's meter and note the models that served them; every event that holds model calls folds through this."""
     state.usage = ev.Usage(
         prompt=state.usage.prompt + used.prompt,
         completion=state.usage.completion + used.completion,
         cached=state.usage.cached + used.cached,
         reasoning=state.usage.reasoning + used.reasoning,
     )
-    if call.resolved_model not in state.resolved_models:
-        state.resolved_models = sorted([*state.resolved_models, call.resolved_model])
+    state.resolved_models = sorted({*state.resolved_models, *models})
 
 
-@_handles(ev.RunStarted)
+def spend(state: RunState, call: ev.LlmCall) -> None:
+    add_usage(state, call.usage, [call.resolved_model])
+
+
+@handles(ev.RunStarted)
 def _run_started(state: RunState, e: ev.RunStarted) -> None:
     if state.run is not None:
         raise _bad(e, "the run already started")
     state.run = e
 
 
-@_handles(ev.JobSubmitIntent)
+@handles(ev.JobSubmitIntent)
 def _job_submit_intent(state: RunState, e: ev.JobSubmitIntent) -> None:
     job = _job(state, e.target, e)
     if e.attempt <= job.job_attempt:
@@ -319,7 +325,7 @@ def _job_submit_intent(state: RunState, e: ev.JobSubmitIntent) -> None:
     job.job_attempt, job.job_token, job.slurm_id = e.attempt, e.token, None
 
 
-@_handles(ev.JobSubmitted)
+@handles(ev.JobSubmitted)
 def _job_submitted(state: RunState, e: ev.JobSubmitted) -> None:
     job = _job(state, e.target, e)
     if e.attempt > job.job_attempt:
@@ -335,7 +341,7 @@ def _job_submitted(state: RunState, e: ev.JobSubmitted) -> None:
         state.candidates[e.target].status = "submitted"
 
 
-@_handles(ev.JobStarted)
+@handles(ev.JobStarted)
 def _job_started(state: RunState, e: ev.JobStarted) -> None:
     job = _job(state, e.target, e)
     if e.attempt != job.job_attempt:
@@ -346,7 +352,7 @@ def _job_started(state: RunState, e: ev.JobStarted) -> None:
         state.candidates[e.target].status = "running"
 
 
-@_handles(ev.JobAttemptFailed)
+@handles(ev.JobAttemptFailed)
 def _job_attempt_failed(state: RunState, e: ev.JobAttemptFailed) -> None:
     job = _job(state, e.target, e)
     if e.attempt != job.job_attempt or job.job_token is None:
@@ -364,7 +370,7 @@ def _job_attempt_failed(state: RunState, e: ev.JobAttemptFailed) -> None:
     job.job_token, job.slurm_id = None, None
 
 
-@_handles(ev.BaselineIngested)
+@handles(ev.BaselineIngested)
 def _baseline_ingested(state: RunState, e: ev.BaselineIngested) -> None:
     if state.baseline.status == "ingested":
         return
@@ -374,7 +380,7 @@ def _baseline_ingested(state: RunState, e: ev.BaselineIngested) -> None:
     state.baseline.n_rows = e.n_rows
 
 
-@_handles(ev.RoundOpened)
+@handles(ev.RoundOpened)
 def _round_opened(state: RunState, e: ev.RoundOpened) -> None:
     if e.round <= len(state.rounds):
         return
@@ -385,7 +391,7 @@ def _round_opened(state: RunState, e: ev.RoundOpened) -> None:
     state.rounds.append(RoundState(index=e.round, b_effective=e.b_effective))
 
 
-@_handles(ev.DecisionRecorded)
+@handles(ev.DecisionRecorded)
 def _decision_recorded(state: RunState, e: ev.DecisionRecorded) -> None:
     if e.decision_id in state.decisions:
         return
@@ -396,10 +402,10 @@ def _decision_recorded(state: RunState, e: ev.DecisionRecorded) -> None:
     rnd.decision_ids.append(e.decision_id)
     if e.kind != "develop_component":
         rnd.attempts += 1
-    _spend(state, e)
+    spend(state, e)
 
 
-@_handles(ev.DecisionValidated)
+@handles(ev.DecisionValidated)
 def _decision_validated(state: RunState, e: ev.DecisionValidated) -> None:
     decision = _decision(state, e.decision_id, e)
     if decision.status != "recorded":
@@ -410,7 +416,7 @@ def _decision_validated(state: RunState, e: ev.DecisionValidated) -> None:
     decision.normalized_sha = e.normalized_sha
 
 
-@_handles(ev.CandidatesAllocated)
+@handles(ev.CandidatesAllocated)
 def _candidates_allocated(state: RunState, e: ev.CandidatesAllocated) -> None:
     rnd = _round(state, e.round, e)
     if rnd.status == "allocated":
@@ -450,7 +456,7 @@ def _candidates_allocated(state: RunState, e: ev.CandidatesAllocated) -> None:
     state.stop.consecutive_rejections = 0
 
 
-@_handles(ev.CandidateCompleted)
+@handles(ev.CandidateCompleted)
 def _candidate_completed(state: RunState, e: ev.CandidateCompleted) -> None:
     candidate = _candidate(state, e.candidate, e)
     if candidate.status in COMPLETED:
@@ -462,37 +468,37 @@ def _candidate_completed(state: RunState, e: ev.CandidateCompleted) -> None:
     candidate.completed_attempt = e.attempt
 
 
-@_handles(ev.SelfvalComputed)
+@handles(ev.SelfvalComputed)
 def _selfval_computed(state: RunState, e: ev.SelfvalComputed) -> None:
     candidate = _candidate(state, e.candidate, e)
     if candidate.selfval_sha is None:
         candidate.selfval_sha = e.selfval_sha
 
 
-@_handles(ev.LedgerRowFrozen)
+@handles(ev.LedgerRowFrozen)
 def _ledger_row_frozen(state: RunState, e: ev.LedgerRowFrozen) -> None:
     candidate = _candidate(state, e.candidate, e)
     if candidate.ledger_row_sha is None:
         candidate.ledger_row_sha = e.row_sha
 
 
-@_handles(ev.CriticAdvisory)
+@handles(ev.CriticAdvisory)
 def _critic_advisory(state: RunState, e: ev.CriticAdvisory) -> None:
     rnd = _round(state, e.round, e)
     if rnd.critic_row_sha is not None or rnd.critic_unavailable:
         return
     rnd.critic_row_sha = e.row_sha
-    _spend(state, e)
+    spend(state, e)
 
 
-@_handles(ev.CriticUnavailable)
+@handles(ev.CriticUnavailable)
 def _critic_unavailable(state: RunState, e: ev.CriticUnavailable) -> None:
     rnd = _round(state, e.round, e)
     if rnd.critic_row_sha is None:
         rnd.critic_unavailable = True
 
 
-@_handles(ev.ComponentRequested)
+@handles(ev.ComponentRequested)
 def _component_requested(state: RunState, e: ev.ComponentRequested) -> None:
     if e.request_id in state.components:
         return
@@ -503,7 +509,7 @@ def _component_requested(state: RunState, e: ev.ComponentRequested) -> None:
         name=e.name, reference_candidate=e.reference_candidate, request_sha=e.request_sha)
 
 
-@_handles(ev.ComponentAttempt)
+@handles(ev.ComponentAttempt)
 def _component_attempt(state: RunState, e: ev.ComponentAttempt) -> None:
     if e.request_id not in state.components:
         raise _bad(e, f"unknown component request {e.request_id!r}")
@@ -512,10 +518,10 @@ def _component_attempt(state: RunState, e: ev.ComponentAttempt) -> None:
         return
     component.attempts.append(ComponentAttemptRecord(
         attempt=e.attempt, outcome=e.outcome, failure_stage=e.failure_stage))
-    _spend(state, e)
+    spend(state, e)
 
 
-@_handles(ev.ComponentResult)
+@handles(ev.ComponentResult)
 def _component_result(state: RunState, e: ev.ComponentResult) -> None:
     if e.request_id not in state.components:
         raise _bad(e, f"unknown component request {e.request_id!r}")
@@ -528,7 +534,7 @@ def _component_result(state: RunState, e: ev.ComponentResult) -> None:
     component.component_sha = e.component_sha
 
 
-@_handles(ev.StopRequested)
+@handles(ev.StopRequested)
 def _stop_requested(state: RunState, e: ev.StopRequested) -> None:
     _round(state, e.round, e)
     if e.decision_id is not None:
@@ -539,7 +545,7 @@ def _stop_requested(state: RunState, e: ev.StopRequested) -> None:
     state.stop.pending = e
 
 
-@_handles(ev.StopAccepted)
+@handles(ev.StopAccepted)
 def _stop_accepted(state: RunState, e: ev.StopAccepted) -> None:
     rnd = _round(state, e.round, e)
     if state.stop.accepted is not None:
@@ -551,7 +557,7 @@ def _stop_accepted(state: RunState, e: ev.StopAccepted) -> None:
     rnd.status = "stopped"
 
 
-@_handles(ev.StopRejected)
+@handles(ev.StopRejected)
 def _stop_rejected(state: RunState, e: ev.StopRejected) -> None:
     _round(state, e.round, e)
     if e.decision_id is not None and any(
@@ -562,7 +568,7 @@ def _stop_rejected(state: RunState, e: ev.StopRejected) -> None:
     state.stop.consecutive_rejections += 1
 
 
-@_handles(ev.DeliveryAssembled)
+@handles(ev.DeliveryAssembled)
 def _delivery_assembled(state: RunState, e: ev.DeliveryAssembled) -> None:
     if state.delivery is not None:
         return
@@ -571,7 +577,7 @@ def _delivery_assembled(state: RunState, e: ev.DeliveryAssembled) -> None:
     state.delivery = e
 
 
-@_handles(ev.LibraryFrozen)
+@handles(ev.LibraryFrozen)
 def _library_frozen(state: RunState, e: ev.LibraryFrozen) -> None:
     if state.library is not None:
         return
@@ -580,7 +586,7 @@ def _library_frozen(state: RunState, e: ev.LibraryFrozen) -> None:
     state.library = e
 
 
-@_handles(ev.RunFinished)
+@handles(ev.RunFinished)
 def _run_finished(state: RunState, e: ev.RunFinished) -> None:
     if state.terminal:
         return
@@ -590,7 +596,7 @@ def _run_finished(state: RunState, e: ev.RunFinished) -> None:
     state.finished_status = e.status
 
 
-@_handles(ev.RoundSkipped)
+@handles(ev.RoundSkipped)
 def _round_skipped(state: RunState, e: ev.RoundSkipped) -> None:
     rnd = _round(state, e.round, e)
     if rnd.status == "skipped":
@@ -602,7 +608,7 @@ def _round_skipped(state: RunState, e: ev.RoundSkipped) -> None:
     state.consecutive_skips += 1
 
 
-@_handles(ev.Resumed)
+@handles(ev.Resumed)
 def _resumed(state: RunState, e: ev.Resumed) -> None:
     state.resumes += 1
     if state.terminal:
@@ -643,4 +649,7 @@ def fold(events: Iterable[ev._Event]) -> RunState:
 
 
 def state_hash(state: RunState) -> str:
-    return sha256_hex(canonical_json(state.model_dump(mode="json")))
+    payload = state.model_dump(mode="json")
+    if state.ext:
+        payload["ext"] = state.ext
+    return sha256_hex(canonical_json(payload))

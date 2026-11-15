@@ -1,0 +1,103 @@
+task_family: amp
+contract_path: configs/amp_contract.yaml
+pathogen: ecoli
+asset_root: backends/amp_assets/zenodo_17018363
+known_peptides: backends/amp_assets/grampa/grampa.csv
+workers:
+  macrel_python: backends/amp_assets/envs/macrel/bin/python
+  toxinpred3_python: backends/amp_assets/envs/toxinpred3/bin/python
+  apex_python: backends/amp_assets/envs/apex/bin/python
+  apex_dir: backends/amp_assets/apex
+training_precision: fp32
+protocol_condition: no_self_validation
+seed: 3101
+total_updates: 7680
+initial_schedule_horizon: 1024
+online_generation:
+  count: 1000
+  count_scope: total
+  temperature: 1.0
+  top_p: 1.0
+  batch_size: 125
+delivery:
+  count: 30
+  count_scope: total
+blind_report:
+  primary_source: apex_ecoli
+  secondary_source: apex_saureus
+  metric: mic_micromolar
+  within_condition: median
+  across_conditions: minimum
+  incomplete_scores: report_incomplete_with_original_denominator
+control:
+  proposals:
+    candidates_per_round: 3
+    candidate_budget: 15
+    rounds_min: 3
+    rounds_max: 5
+    anchor_candidate: true
+    max_decision_attempts: 3
+    max_skipped_rounds: 1
+  budget:
+    steps:
+      min: 128
+      default: 256
+      max: 1024
+  selection:
+    visible_only: true
+    plan:
+      aggregation: single
+      components:
+      - measurement: activity_ecoli
+      count:
+        AMP: 30
+      strata:
+      - AMP
+      filters:
+      - measurement: legal
+        minimum: 1
+      deduplication: exact
+      exclude_training_copies: true
+      alphabet: ACDEFGHIKLMNPQRSTVWY
+      min_length: 5
+      max_length: 32
+      missing: error
+  health:
+    min_distance_fraction: 0.257
+    min_pairwise_ratio: 0.2
+  stop:
+    require_assignment_qualified: true
+    min_updates_fraction: 0.0
+  selfval:
+    scalar: cm_raw
+  synthesis:
+    enabled: false
+    roles: []
+    max_requests: 0
+    attempts_per_request: 3
+  levers:
+  - reward
+  checks_text: false
+  modules:
+    trajectory:
+      view: reward
+      restart: true
+llm:
+  model: gpt-6-luna
+  max_prompt_tokens: 60000
+  max_output_tokens: 16000
+  tool_calls_per_decision: 4
+  max_total_tokens: 500000
+  pricing_usd_per_mtok:
+    input: null
+    cached: null
+    output: null
+scheduler:
+  max_concurrent_jobs: 15
+  partition: gpu
+  gres: gpu:1
+  cpus: 2
+  mem: 8G
+  time_factor: 1.6
+  max_infra_retries: 2
+  poll_seconds: 60

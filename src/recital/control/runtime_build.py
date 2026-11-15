@@ -21,7 +21,7 @@ from recital.success import SuccessSpec
 from recital.training.policy_precision import apply_training_precision, training_precision
 
 TASK_MODULES = {"loopseq": "tasks.loopseq.experiment", "cre": "tasks.promoter.experiment",
-                "cm": "tasks.protein.cm.experiment"}
+                "cm": "tasks.protein.cm.experiment", "amp": "tasks.amp.experiment"}
 
 
 def build_runtime(config, *, repo_root, output, device, audit_oracle_factories):

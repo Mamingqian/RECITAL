@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
+from .recipes import LEVER_FIELDS, LEVERS
 from .transport import ToolSpec
 
 START_MODES = ("from_initial", "from_parent", "continue_parent")
@@ -18,7 +19,7 @@ ALLOWED_KEYS = frozenset({"type", "enum", "properties", "required", "additionalP
                           "items", "description", "maxItems"})
 
 
-def _object(properties: Mapping[str, Any]) -> dict[str, Any]:
+def object_schema(properties: Mapping[str, Any]) -> dict[str, Any]:
     return {"type": "object", "additionalProperties": False,
             "required": list(properties), "properties": dict(properties)}
 
@@ -29,15 +30,15 @@ def _nullable(schema: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _name(names: Sequence[str] | None, description: str) -> dict[str, Any]:
+def name_schema(names: Sequence[str] | None, description: str) -> dict[str, Any]:
     if names:
         return {"type": "string", "enum": list(names), "description": description}
     return {"type": "string", "description": description}
 
 
 def _call(names: Sequence[str] | None, what: str, params: str | None = None) -> dict[str, Any]:
-    return _object({
-        "name": _name(names, f"{what} name"),
+    return object_schema({
+        "name": name_schema(names, f"{what} name"),
         "params_json": {"type": "string",
                         "description": params or f"JSON object text of the {what}'s parameters; '{{}}' for defaults"},
     })
@@ -69,8 +70,14 @@ def round_response_schema(
     synthesis_roles: Sequence[str] | None = None,
     approved_references: Sequence[str] = (),
     aggregator_form: Mapping[str, Any] | None = None,
+    levers: Sequence[str] = LEVERS,
+    extra_candidate_fields: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The Strategist's per-round response.
+
+    `levers` names the levers of a recipe the search may edit; the candidate fields of the others are left out.
+    `extra_candidate_fields` are the property schemas a module adds to every candidate (`ext.Extension.candidate_fields`);
+    a name a candidate already has is refused.
 
     `synthesis_roles=None` removes `develop_component` and the `component` field entirely.
     `stop_only` leaves `stop` as the only kind and no room for candidates.
@@ -80,7 +87,7 @@ def round_response_schema(
     kinds = ["stop"] if stop_only else ["propose", "stop"]
     if synthesis_roles is not None and not stop_only:
         kinds.append("develop_component")
-    candidate = _object({
+    fields = {
         "parent": {"type": "string", "description": "'initial' or a completed candidate id"},
         "start": {"type": "string", "enum": list(START_MODES),
                   "description": "from_initial restarts from the SFT policy; from_parent starts a new stage "
@@ -97,27 +104,31 @@ def round_response_schema(
                                         "parent's, so a changed lr needs start from_parent or from_initial"}),
         "kl": _nullable({"type": "number", "description": "KL coefficient; null inherits"}),
         "group_size": _nullable({"type": "integer", "description": "rollouts per prompt; null inherits"}),
-        "enabled_oracles": _nullable({"type": "array", "items": _name(reward_oracles, "reward oracle"),
+        "enabled_oracles": _nullable({"type": "array", "items": name_schema(reward_oracles, "reward oracle"),
                                       "description": "oracles that make up the reward; null inherits"}),
         "aggregator": _nullable(_call(aggregators, "aggregator", _aggregator_params(aggregator_form))),
-        "oracle_utilities": _nullable({"type": "array", "items": _object({
-            "oracle": _name(reward_oracles, "oracle the utility applies to"),
-            "name": _name(utilities, "utility name"),
+        "oracle_utilities": _nullable({"type": "array", "items": object_schema({
+            "oracle": name_schema(reward_oracles, "oracle the utility applies to"),
+            "name": name_schema(utilities, "utility name"),
             "params_json": {"type": "string", "description": "JSON object text of the utility's parameters"},
         })}),
         "penalties": _nullable({"type": "array", "items": _call(penalties, "penalty"),
                                 "description": "empty array removes all penalties; null inherits"}),
         "gates": _nullable({"type": "array", "items": _call(gates, "gate"),
                             "description": "empty array removes all gates; null inherits"}),
-    })
+    }
+    taken = sorted(set(extra_candidate_fields or {}) & set(fields))
+    if taken:
+        raise ValueError(f"a module may not redefine the candidate fields {taken}")
+    candidate = object_schema({**fields, **(extra_candidate_fields or {})})
     properties: dict[str, Any] = {
         "kind": {"type": "string", "enum": kinds},
         "rationale": {"type": "string", "description": "at most 120 words"},
         "candidates": {"type": "array", "maxItems": 0 if stop_only else max_candidates, "items": candidate,
                        "description": f"exactly {max_candidates} candidates when kind is propose; otherwise empty"},
-        "stop": _nullable(_object({
+        "stop": _nullable(object_schema({
             "outcome": {"type": "string", "enum": list(STOP_OUTCOMES)},
-            "assignment": {"type": "array", "items": _object({
+            "assignment": {"type": "array", "items": object_schema({
                 "condition": {"type": "string", "enum": list(conditions)},
                 "candidate": {"type": "string", "description": "completed candidate id delivering this condition"},
             }), "description": "one entry per condition when outcome is deliver; empty otherwise"},
@@ -125,21 +136,32 @@ def round_response_schema(
         })),
     }
     if synthesis_roles is not None:
-        properties["component"] = _nullable(_object({
+        properties["component"] = _nullable(object_schema({
             "role": {"type": "string", "enum": list(synthesis_roles)},
             "name": {"type": "string", "description": "new primitive name; must not exist yet"},
             "description": {"type": "string"},
             "biological_motivation": {"type": "string"},
             "oracle": _nullable({"type": "string", "description": "oracle a per_oracle_utility applies to"}),
             "reference_candidate": {"type": "string", "description": "candidate whose recipe the component is tested in"},
-            "reference_bindings": {"type": "array", "items": _name(approved_references, "approved reference"),
+            "reference_bindings": {"type": "array", "items": name_schema(approved_references, "approved reference"),
                                    "description": "approved reference datasets the code may use"},
         }))
-    return _object(properties)
+    return _without_frozen(object_schema(properties), levers)
+
+
+def _without_frozen(schema: dict[str, Any], levers: Sequence[str]) -> dict[str, Any]:
+    """`schema` with the candidate fields of every lever not in `levers` removed (the schema itself when none is)."""
+    frozen = {key for lever, names in LEVER_FIELDS.items() if lever not in levers for key in names}
+    if not frozen:
+        return schema
+    candidate = schema["properties"]["candidates"]["items"]
+    kept = {key: value for key, value in candidate["properties"].items() if key not in frozen}
+    candidate["properties"], candidate["required"] = kept, list(kept)
+    return schema
 
 
 def critic_schema() -> dict[str, Any]:
-    return _object({
+    return object_schema({
         "concerns": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
         "requested_evidence": {"type": "array", "maxItems": 4, "items": {"type": "string"}},
         "rationale": {"type": "string", "description": "at most 80 words"},
@@ -147,7 +169,7 @@ def critic_schema() -> dict[str, Any]:
 
 
 def coder_output_schema(roles: Sequence[str]) -> dict[str, Any]:
-    return _object({
+    return object_schema({
         "primitive_name": {"type": "string"},
         "role": {"type": "string", "enum": list(roles)},
         "code": {"type": "string"},
@@ -163,11 +185,11 @@ def retrieval_tools(conditions: Sequence[str], sort_fields: Sequence[str]) -> tu
         "get_candidate",
         "Effective recipe, start and training-curve tail of one completed candidate; its ledger row is already "
         "in the ledger.",
-        _object({"id": {"type": "string"}}))
+        object_schema({"id": {"type": "string"}}))
     rows = ToolSpec(
         "get_rows",
         "Sequences and measurements of up to 50 rows of one candidate's pool for one condition.",
-        _object({
+        object_schema({
             "candidate": {"type": "string"},
             "condition": {"type": "string", "enum": list(conditions)},
             "n": {"type": "integer", "description": "1 to 50"},

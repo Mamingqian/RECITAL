@@ -84,6 +84,10 @@ class EventLog:
     def head_hash(self) -> str:
         return self._events[-1].hash if self._events else GENESIS_HASH
 
+    def now(self) -> str:
+        """The time the next event would carry: the log's own clock."""
+        return self._clock()
+
     def events(self, after: int = 0) -> Iterator[Event]:
         """Events with `seq > after`, from a snapshot taken at call time."""
         return iter(tuple(self._events[after:]))

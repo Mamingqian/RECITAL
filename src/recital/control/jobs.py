@@ -11,6 +11,7 @@ another version is refused instead of read as if it meant something else.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -388,6 +389,18 @@ def read_result(directory: str | Path) -> JobResult | None:
     if not path.exists():
         return None
     return JobResult.model_validate(json.loads(path.read_text()))
+
+
+def read_result_listed(directory: str | Path) -> JobResult | None:
+    """`read_result` after listing the directory, which makes a network file system client revalidate its cached view
+    of the directory (a result another host wrote seconds ago can still be a cached miss on this one)."""
+    try:
+        with os.scandir(directory) as entries:
+            for _ in entries:
+                pass
+    except FileNotFoundError:
+        pass
+    return read_result(directory)
 
 
 def read_failure(directory: str | Path) -> JobFailure | None:

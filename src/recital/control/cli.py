@@ -3,12 +3,21 @@
     python -m recital.control.cli preflight --config C --output DIR
     python -m recital.control.cli run --config C --output DIR [--arm A --seed N --scheduler slurm]
     python -m recital.control.cli campaign --config C --output-root ROOT --arms A B C --seeds 0 1 2
+                                             [--transport MODULE:CLASS]
     python -m recital.control.cli fixed-recipe --config C --output-root ROOT --steps 4000 8192 --seeds 0 1 2
+    python -m recital.control.cli arm-search --config C --arm random|rule|module:Class --output-root ROOT --seeds 0 1 2
+                                                [--match-root ROOT_OF_SEARCHES]
     python -m recital.control.cli status DIR [DIR ...]
+    python -m recital.control.cli human-search --config C --output DIR    (control.modules.modes.mode: human_only)
+    python -m recital.control.cli show --run DIR                          (what a copilot or human-only cell waits for)
+    python -m recital.control.cli note --run DIR --minutes M --text T [--kind direction|note]
+    python -m recital.control.cli approve --run DIR --minutes M [--decision ID] [--veto INDEX ...] [--text T]
+    python -m recital.control.cli propose --run DIR --minutes M --file RESPONSE.json
 """
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import signal
 import sys
@@ -43,6 +52,8 @@ def load_config(path: Path, args: argparse.Namespace) -> dict[str, Any]:
             config[target] = value
     if getattr(args, "max_concurrent_jobs", None) is not None:
         config["scheduler"]["max_concurrent_jobs"] = args.max_concurrent_jobs
+    if getattr(args, "partition", None) is not None:
+        config["scheduler"]["partition"] = args.partition
     return config
 
 
@@ -59,6 +70,26 @@ def make_transport(config: dict[str, Any]) -> ResponsesTransport:
     llm = ControlContract.from_config(config).llm
     return ResponsesTransport(model=llm.model, max_output_tokens=llm.max_output_tokens, base_url=llm.base_url,
                               api_key_file=llm.api_key_file, schema_dialect=llm.schema_dialect)
+
+
+def make_campaign_transport(config: dict[str, Any], spec: str | None, run_dir: Path):
+    """The LLM transport of one campaign cell: the config's own, or the class `MODULE:CLASS` of `--transport` over it.
+
+    The class is called as `Class(inner=<the transport the config builds>, config=<the cell's config>, run_dir=<the cell's
+    directory>)`; it stands in for the transport the engine talks to and may forward any request to `inner`. When it has a
+    `bind` method, `cmd_campaign` calls `bind(engine)` once the cell is prepared, as `cmd_arm_search` does for its transports.
+    """
+    inner = make_transport(config)
+    if spec is None:
+        return inner
+    module_name, _, class_name = spec.partition(":")
+    if not module_name or not class_name:
+        raise ControlError(f"--transport takes MODULE:CLASS, got {spec!r}")
+    try:
+        transport_class = getattr(importlib.import_module(module_name), class_name)
+    except (ImportError, AttributeError) as error:
+        raise ControlError(f"--transport {spec!r} names no importable class: {error}") from error
+    return transport_class(inner=inner, config=config, run_dir=run_dir)
 
 
 def make_components(parts: dict[str, Any]):
@@ -118,10 +149,14 @@ def _finish(prepared: Prepared, args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config, args)
+    return run_cell(args, config, make_transport(config), make_components)
+
+
+def run_cell(args: argparse.Namespace, config: dict[str, Any], transport, components) -> int:
     run_dir = args.output.expanduser().resolve()
     stop = _install_stop_flag()
     prepared = prepare(config, run_dir=run_dir, repo_root=args.repo_root, scheduler=make_scheduler(args.scheduler, run_dir),
-                       transport=make_transport(config), device=args.device, components=make_components)
+                       transport=transport, device=args.device, components=components)
     try:
         cell = Cell(run_dir.name, prepared.engine)
         run_campaign([cell], poll_seconds=prepared.settings.control.scheduler.poll_seconds,
@@ -129,6 +164,68 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps(_finish(prepared, args) if cell.done else {"status": "interrupted"}, sort_keys=True))
     finally:
         prepared.close()
+    return 0
+
+
+def cmd_human_search(args: argparse.Namespace) -> int:
+    """A cell whose Strategist is a person: the contract, validators, selection and delivery are the searches'."""
+    from .arms import arm_config
+    from .ext.modes import HumanTransport
+
+    base = load_config(args.config, args)
+    declared = ((base.get("control") or {}).get("modules") or {}).get("modes") or {}
+    if declared.get("mode") != "human_only":
+        raise ControlError("human-search runs a cell that declares control.modules.modes.mode: human_only")
+    config = {**arm_config(base, "human"), "protocol_condition": "no_self_validation"}
+    return run_cell(args, config, HumanTransport(), None)
+
+
+def _fold_run(run: Path):
+    events = read_events(Path(run) / "events" / "log.jsonl")
+    if not events:
+        raise ControlError(f"{run} holds no event log")
+    return fold(from_record(event) for event in events)
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    from .ext.modes import write_inbox
+
+    text = args.text if args.text is not None else args.file.read_text()
+    print(json.dumps({"posted": write_inbox(args.run, args.kind, minutes=args.minutes, text=text).name}))
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    from .ext.modes import awaiting_approval, write_inbox
+
+    waiting = awaiting_approval(_fold_run(args.run))
+    decision = args.decision or (waiting[0] if waiting else None)
+    if decision is None:
+        raise ControlError("no proposal is waiting for approval")
+    posted = write_inbox(args.run, "approve", minutes=args.minutes, decision_id=decision, vetoed=args.veto or [],
+                         text=args.text or "")
+    print(json.dumps({"posted": posted.name, "decision": decision, "vetoed": args.veto or []}))
+    return 0
+
+
+def cmd_propose(args: argparse.Namespace) -> int:
+    from .ext.modes import write_inbox
+
+    response = json.loads(args.file.read_text())
+    print(json.dumps({"posted": write_inbox(args.run, "propose", minutes=args.minutes, response=response).name}))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    from .ext.modes import effort, pending_holds
+
+    state = _fold_run(args.run)
+    waiting = pending_holds(args.run, state)
+    for path in waiting:
+        print(f"==== {path} ====\n{path.read_text()}")
+    print(json.dumps({"run": Path(args.run).name, "status": state.finished_status or "running",
+                      "waiting_for_you": [path.stem for path in waiting], "effort": effort(state),
+                      "refused": (state.ext.get("modes") or {}).get("refused", [])}, indent=1, sort_keys=True))
     return 0
 
 
@@ -147,9 +244,13 @@ def cmd_campaign(args: argparse.Namespace) -> int:
             for arm in args.arms:
                 config = {**base, "protocol_condition": arm, "seed": seed}
                 run_dir = cell_dir(args.output_root.expanduser().resolve(), config, arm, seed)
+                spec = getattr(args, "transport", None)
+                transport = make_campaign_transport(config, spec, run_dir)
                 prepared = prepare(config, run_dir=run_dir, repo_root=args.repo_root,
-                                   scheduler=make_scheduler(args.scheduler, run_dir), transport=make_transport(config),
+                                   scheduler=make_scheduler(args.scheduler, run_dir), transport=transport,
                                    device=args.device, components=make_components, may_submit=gate.allow)
+                if spec is not None and hasattr(transport, "bind"):
+                    transport.bind(prepared.engine)
                 prepared_cells.append(prepared)
                 cells.append(Cell(run_dir.name, prepared.engine))
         gate.bind(cells)
@@ -180,6 +281,17 @@ def cmd_drill_coder(args: argparse.Namespace) -> int:
         item["status"] == "published" for item in result["components"].values()) else 1
 
 
+def parse_variant(text: str) -> tuple[str, dict[str, Any]]:
+    """`LABEL=JSON`: a fixed-recipe variant, the JSON object holding candidate fields (see `fixed_recipe.EDITABLE`)."""
+    label, sep, body = text.partition("=")
+    if not sep or not label.isidentifier():
+        raise ControlError(f"a variant is LABEL=JSON with an identifier label, got {text[:40]!r}")
+    edits = json.loads(body)
+    if not isinstance(edits, dict):
+        raise ControlError("a variant's JSON must be an object")
+    return label, edits
+
+
 def cmd_fixed_recipe(args: argparse.Namespace) -> int:
     """No-search control cells: the declared initial recipe trained once for each of `--steps`, per seed."""
     from .fixed_recipe import prepare_cell
@@ -188,15 +300,18 @@ def cmd_fixed_recipe(args: argparse.Namespace) -> int:
     gate, prepared_cells, cells = JobGate(base["scheduler"]["max_concurrent_jobs"]), [], []
     stop = _install_stop_flag()
     try:
+        variants = [parse_variant(text) for text in args.variant] if args.variant else [(None, None)]
         for seed in args.seeds:
-            for steps in args.steps:
-                config = {**base, "protocol_condition": "no_self_validation", "seed": seed}
-                run_dir = args.output_root.expanduser().resolve() / f"{config.get('task_family')}_fixedrecipe_steps{steps}_seed{seed}"
-                prepared = prepare_cell(config, steps=steps, run_dir=run_dir, repo_root=args.repo_root,
-                                        scheduler=make_scheduler(args.scheduler, run_dir), device=args.device,
-                                        may_submit=gate.allow)
-                prepared_cells.append(prepared)
-                cells.append(Cell(run_dir.name, prepared.engine))
+            for label, edits in variants:
+                for steps in args.steps:
+                    config = {**base, "protocol_condition": "no_self_validation", "seed": seed}
+                    name = f"{config.get('task_family')}_fixedrecipe{'' if label is None else '_' + label}_steps{steps}_seed{seed}"
+                    run_dir = args.output_root.expanduser().resolve() / name
+                    prepared = prepare_cell(config, steps=steps, run_dir=run_dir, repo_root=args.repo_root,
+                                            scheduler=make_scheduler(args.scheduler, run_dir), device=args.device,
+                                            may_submit=gate.allow, edits=edits, label=label)
+                    prepared_cells.append(prepared)
+                    cells.append(Cell(run_dir.name, prepared.engine))
         gate.bind(cells)
         states = run_campaign(cells, poll_seconds=base["scheduler"]["poll_seconds"], should_stop=lambda: stop[0])
         summary = {name: state.finished_status for name, state in states.items()}
@@ -221,7 +336,7 @@ def status_line(run_dir: Path) -> dict[str, Any]:
         counts[candidate.status] = counts.get(candidate.status, 0) + 1
     usage = state.usage
     attention = run_dir / "needs_attention.json"
-    return {
+    line = {
         "run": run_dir.name, "status": state.finished_status or "running", "rounds_done": state.rounds_done,
         "open_round": state.open_round.index if state.open_round else None, "candidates": counts,
         "baseline": state.baseline.status, "committed_updates": state.committed_updates,
@@ -234,11 +349,60 @@ def status_line(run_dir: Path) -> dict[str, Any]:
         "needs_attention": json.loads(attention.read_text()) if attention.exists() and state.finished_status
         == "needs_attention" else None,
     }
+    if state.ext.get("modes"):
+        from .ext.modes import effort
+        line["human"] = effort(state)
+    return line
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     for directory in args.directories:
         print(json.dumps(status_line(Path(directory)), sort_keys=True))
+    return 0
+
+
+def matched_updates(match_root: Path, task_family: str, seed: int) -> int:
+    """The updates the comparison search of this seed committed, which an arm's budget is set to."""
+    cell = match_root.expanduser().resolve() / f"{task_family}_no_self_validation_seed{seed}"
+    line = status_line(cell)
+    if line.get("status") in (None, "not_started"):
+        raise ControlError(f"no comparison search at {cell}")
+    return int(line["committed_updates"])
+
+
+def cmd_arm_search(args: argparse.Namespace) -> int:
+    """Cells whose Strategist is a non-LLM arm (`arms.py`): the contract, validators, selection and delivery are the searches'."""
+    from .arms import ArmTransport, arm_class, arm_config
+
+    base = load_config(args.config, args)
+    arm_type = arm_class(args.arm)
+    gate, prepared_cells, cells = JobGate(base["scheduler"]["max_concurrent_jobs"]), [], []
+    stop = _install_stop_flag()
+    try:
+        for seed in args.seeds:
+            updates = (matched_updates(args.match_root, base.get("task_family"), seed) if args.match_root
+                       else args.total_updates)
+            config = {**arm_config(base, arm_type.name, total_updates=updates),
+                      "protocol_condition": "no_self_validation", "seed": seed}
+            run_dir = args.output_root.expanduser().resolve() / f"{config.get('task_family')}_{arm_type.name}_seed{seed}"
+            transport = ArmTransport(arm_type(seed))
+            prepared = prepare(config, run_dir=run_dir, repo_root=args.repo_root,
+                               scheduler=make_scheduler(args.scheduler, run_dir), transport=transport,
+                               device=args.device, components=None, may_submit=gate.allow)
+            transport.bind(prepared.engine)
+            prepared_cells.append(prepared)
+            cells.append(Cell(run_dir.name, prepared.engine))
+        gate.bind(cells)
+        states = run_campaign(cells, poll_seconds=base["scheduler"]["poll_seconds"], should_stop=lambda: stop[0])
+        summary = {name: state.finished_status for name, state in states.items()}
+        if not stop[0] and not args.no_audit:
+            for cell, prepared in zip(cells, prepared_cells):
+                if states[cell.name].finished_status == "frozen":
+                    summary[cell.name] = {"frozen": _finish(prepared, args).get("terminal_audit")}
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    finally:
+        for prepared in prepared_cells:
+            prepared.close()
     return 0
 
 
@@ -262,6 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--seed", type=int)
         p.add_argument("--total-updates", dest="total_updates", type=int)
         p.add_argument("--max-concurrent-jobs", dest="max_concurrent_jobs", type=int)
+        p.add_argument("--partition", help="replaces scheduler.partition of the config (kept in the cell's config.yaml)")
         p.add_argument("--scheduler", choices=("local", "slurm"), default="slurm")
         p.add_argument("--no-audit", action="store_true", help="skip the terminal blind audit")
 
@@ -280,6 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--output-root", type=Path, required=True)
     camp.add_argument("--arms", nargs="+", choices=ARMS, default=["no_self_validation"])
     camp.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    camp.add_argument("--transport", metavar="MODULE:CLASS",
+                      help="a class built over the config's LLM transport as Class(inner=, config=, run_dir=) and bound to "
+                           "the cell's engine (bind(engine)) when it has that method; default: the config's transport")
     camp.set_defaults(func=cmd_campaign)
     drill = sub.add_parser("drill-coder", help="scripted Strategist, real Coder and real training")
     common(drill)
@@ -293,7 +461,51 @@ def build_parser() -> argparse.ArgumentParser:
     fixed.add_argument("--output-root", type=Path, required=True)
     fixed.add_argument("--steps", nargs="+", type=int, required=True)
     fixed.add_argument("--seeds", nargs="+", type=int, required=True)
+    fixed.add_argument("--variant", action="append", metavar="LABEL=JSON",
+                       help="train this edit of the declared recipe instead of the declared recipe itself; repeat for "
+                            "several variants (candidate fields: lr kl group_size enabled_oracles aggregator "
+                            "oracle_utilities penalties gates)")
     fixed.set_defaults(func=cmd_fixed_recipe)
+    arm = sub.add_parser("arm-search", help="cells whose Strategist is a non-LLM arm (random, rule, or module:Class)")
+    common(arm)
+    arm.add_argument("--arm", required=True)
+    arm.add_argument("--output-root", type=Path, required=True)
+    arm.add_argument("--seeds", nargs="+", type=int, required=True)
+    arm.add_argument("--match-root", type=Path,
+                     help="a campaign root of Strategist searches; each cell's total updates is set to the updates "
+                          "its seed's search committed")
+    arm.set_defaults(func=cmd_arm_search)
+    human = sub.add_parser("human-search", help="a cell whose Strategist is a person (modes.mode human_only)")
+    common(human)
+    human.add_argument("--output", type=Path, required=True)
+    human.set_defaults(func=cmd_human_search)
+
+    def posting(p: argparse.ArgumentParser, *, minutes: bool = True) -> None:
+        p.add_argument("--run", type=Path, required=True)
+        if minutes:
+            p.add_argument("--minutes", type=float, required=True,
+                           help="the active minutes this took you, reading included: the effort the search records")
+
+    show = sub.add_parser("show", help="what a copilot or human-only cell waits for you to do, and your effort so far")
+    posting(show, minutes=False)
+    show.set_defaults(func=cmd_show)
+    note = sub.add_parser("note", help="post the direction that opens a copilot search, or a note between rounds")
+    posting(note)
+    note.add_argument("--kind", choices=("direction", "note"), default="note")
+    source = note.add_mutually_exclusive_group(required=True)
+    source.add_argument("--text")
+    source.add_argument("--file", type=Path)
+    note.set_defaults(func=cmd_note)
+    approve = sub.add_parser("approve", help="release a proposal to training, vetoing the candidates named by --veto")
+    posting(approve)
+    approve.add_argument("--decision", help="the proposal (default: the oldest one waiting)")
+    approve.add_argument("--veto", type=int, nargs="*", metavar="INDEX", help="candidates[INDEX] of the proposal")
+    approve.add_argument("--text", help="why; the Strategist reads it beside a veto")
+    approve.set_defaults(func=cmd_approve)
+    propose = sub.add_parser("propose", help="post your response for the round a human_only cell waits on")
+    posting(propose)
+    propose.add_argument("--file", type=Path, required=True, help="JSON in the Strategist's response schema")
+    propose.set_defaults(func=cmd_propose)
     stat = sub.add_parser("status")
     stat.add_argument("directories", nargs="+")
     stat.set_defaults(func=cmd_status)

@@ -5,9 +5,10 @@ Nothing here names an arm.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .ledger import COMPOSITION_LEGEND, LIBRARY_HEALTH_LEGEND
+from .recipes import LEVER_FIELDS, LEVERS
 
 STRATEGIST_SYSTEM = """You are the Strategist of a sequence-design search. Each round you propose candidate \
 reward-and-training recipes; the system trains and measures them in parallel and returns a ledger row per \
@@ -77,8 +78,22 @@ def static_header(*, task: Mapping[str, Any], conditions: list[str], delivery_re
             f"## How candidates are ranked\n{ranking}")
 
 
-def strategist_instructions(*, synthesis: bool) -> str:
-    parts = [STRATEGIST_SYSTEM, LIBRARY_HEALTH_LEGEND, COMPOSITION_LEGEND]
+def lever_text(levers: Sequence[str]) -> str:
+    """What a search that holds a lever fixed is told; empty when both levers are open."""
+    frozen = [lever for lever in LEVERS if lever not in levers]
+    if not frozen:
+        return ""
+    names = ", ".join(key for lever in frozen for key in LEVER_FIELDS[lever])
+    return (f"Lever restriction. In this search the {' and '.join(frozen)} lever is frozen to the parent's values: "
+            f"{names} are not offered in your answer and cannot be edited.")
+
+
+def strategist_instructions(*, synthesis: bool, levers: Sequence[str] = LEVERS, checks_text: bool = True,
+                            modules: Sequence[str] = ()) -> str:
+    parts = [STRATEGIST_SYSTEM, *([LIBRARY_HEALTH_LEGEND, COMPOSITION_LEGEND] if checks_text else [])]
+    if lever_text(levers):
+        parts.append(lever_text(levers))
     if synthesis:
         parts.append(CODER_AVAILABLE)
+    parts.extend(text for text in modules if text)
     return "\n\n".join(parts)

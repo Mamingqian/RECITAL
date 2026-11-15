@@ -2,7 +2,7 @@
 
 The cell is an ordinary control cell with one round and one candidate. The Strategist is scripted (it proposes the
 declared initial recipe, every field left to its default, for `steps` updates), the Coder is off, nothing else is
-edited, and the cell's own library-selection plan, health floor, delivery bound and terminal blind evaluation apply, so the
+edited unless a variant names edits (`edits`: the candidate fields below, each applied once to the declared recipe), and the cell's own library-selection plan, health floor, delivery bound and terminal blind evaluation apply, so the
 library is delivered by the rule the searches use. The learning-rate schedule of the one candidate spans its own length
 (`recipes._training`: a new segment of horizon max(steps, initial_schedule_horizon)).
 
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .drill import ScriptedStrategist
+from .errors import ControlError
 from .launch import Prepared, prepare
 from .scheduler import Scheduler
 
@@ -44,12 +45,22 @@ def fixed_recipe_config(config: Mapping[str, Any], steps: int) -> dict[str, Any]
     return out
 
 
-def script(steps: int) -> list[dict[str, Any]]:
+EDITABLE = ("lr", "kl", "group_size", "enabled_oracles", "aggregator", "oracle_utilities", "penalties", "gates")
+
+
+def script(steps: int, edits: Mapping[str, Any] | None = None, label: str | None = None) -> list[dict[str, Any]]:
     """The scripted answers: the proposal of the declared initial recipe for `steps` updates, the Critic's review of it,
-    and a stop (`ScriptedStrategist` fills the stop's assignment with the one candidate)."""
-    candidate = {"parent": "initial", "start": "from_initial", "hypothesis": "no-search control: the declared initial "
-                 "recipe", "steps": steps, "lr": None, "kl": None, "group_size": None, "enabled_oracles": None,
-                 "aggregator": None, "oracle_utilities": None, "penalties": None, "gates": None}
+    and a stop (`ScriptedStrategist` fills the stop's assignment with the one candidate).
+
+    `edits` sets candidate fields of the proposal (a null field inherits the declared recipe's value); `label` names
+    the variant in the hypothesis."""
+    unknown = set(edits or {}) - set(EDITABLE)
+    if unknown:
+        raise ControlError(f"a fixed-recipe variant may edit {list(EDITABLE)}, not {sorted(unknown)}")
+    what = "the declared initial recipe" + (f", variant {label}" if label else "")
+    candidate = {"parent": "initial", "start": "from_initial", "hypothesis": f"no-search control: {what}",
+                 "steps": steps, "lr": None, "kl": None, "group_size": None, "enabled_oracles": None,
+                 "aggregator": None, "oracle_utilities": None, "penalties": None, "gates": None, **dict(edits or {})}
     base = {"rationale": "no-search control", "candidates": [], "stop": None, "component": None}
     return [{**base, "kind": "propose", "candidates": [candidate]},
             {"concerns": [], "requested_evidence": [], "rationale": "no-search control"},
@@ -57,11 +68,12 @@ def script(steps: int) -> list[dict[str, Any]]:
 
 
 def prepare_cell(config: Mapping[str, Any], *, steps: int, run_dir: Path, repo_root: Path, scheduler: Scheduler,
-                 device: str = "cuda", may_submit: Callable[[], bool] = lambda: True) -> Prepared:
+                 device: str = "cuda", may_submit: Callable[[], bool] = lambda: True,
+                 edits: Mapping[str, Any] | None = None, label: str | None = None) -> Prepared:
     """A fixed-recipe cell ready to run, with the scripted Strategist and no Coder."""
     cell_config = fixed_recipe_config(config, steps)
     conditions = list(cell_config["control"]["selection"]["plan"]["count"])
-    strategist = ScriptedStrategist(script(steps), conditions)
+    strategist = ScriptedStrategist(script(steps, edits, label), conditions)
     return prepare(cell_config, run_dir=run_dir, repo_root=repo_root, scheduler=scheduler, transport=strategist,
                    device=device, components=None, may_submit=may_submit)
 

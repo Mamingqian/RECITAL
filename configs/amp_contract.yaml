@@ -1,0 +1,181 @@
+modality: protein
+task:
+  name: amp_peptides
+  description: Design antimicrobial peptides of 5 to 32 residues with a language-model policy that starts from AMP-Prompt.
+  target_objective: Maximize the delivered library's mean E. coli activity, 1 / (1 + predicted MIC in micromolar)
+  biological_constraints:
+  - Generate the peptide from the ten-token prompt as residues of the 20 standard amino acids, 5 to 32 of them, then stop.
+  - Deliver 30 distinct peptides chosen from the candidate's pool of 1000 by predicted E. coli activity.
+  - Exclude peptides that occur in the public MIC table the activity predictors were fitted on.
+  - Scores are predictor outputs, not measured activity, toxicity or hemolysis; none is a probability of the real property.
+  selection_semantics:
+    metric: amp_selection_score
+    aggregation: primary
+    oracle_sources:
+    - activity_ecoli
+    per_sequence_score: E. coli activity, 1 / (1 + predicted MIC in micromolar)
+    candidate_score: mean over the selected library
+    library_count: 30
+    delivery_protocol: selected_evaluation_library_v1
+    additional_delivery_draws: 0
+    direction: maximize
+    audit_used_for_selection: false
+representation:
+  alphabet: ACDEFGHIKLMNPQRSTVWY
+  tokenizer: residue
+  min_length: 5
+  max_length: 32
+  variable_length: true
+  pad_token: '[PAD]'
+  eos_token: '[SEP]'
+  prefix: ''
+base_models:
+- id: amp_prompt
+  model: backends/amp_assets/policy/initial
+data:
+  source: zenodo:17018363/prompt_model.zip
+  sequence_column: sequence
+  token_alphabet: ACDEFGHIKLMNPQRSTVWY
+  conditioning_prompts:
+  - '[P0] [P1] [P2] [P3] [P4] [P5] [P6] [P7] [P8] [P9] [CLS]'
+  max_completion_length: 33
+  min_new_tokens: 5
+sft_checkpoint: backends/amp_assets/policy/initial
+oracles:
+  candidate_pool:
+  - id: activity_ecoli
+    notes: 1 / (1 + MIC) for the MIC in micromolar predicted by a GPT-2 regressor fitted to published E. coli MIC records
+      (log10 micromolar). A score in (0, 1), higher for a lower predicted MIC; 0.5 is a predicted MIC of 1 micromolar. It
+      saturates, so a gain near 1 needs a large drop in predicted MIC. Predicted, not measured activity.
+  - id: activity_saureus
+    notes: The same score for S. aureus, from a regressor fitted to published S. aureus MIC records. Rankings of peptides by
+      the E. coli, S. aureus and P. aeruginosa scores agree closely (rank correlation about 0.75).
+  - id: activity_paeruginosa
+    notes: The same score for P. aeruginosa, from a regressor fitted to published P. aeruginosa MIC records.
+  - id: amp_likelihood
+    notes: Probability that the peptide is an antimicrobial peptide, from the AMP classifier of the Macrel package (version
+      1.6.1, trained on AmPEP and iAMP-2L sets). Higher is better.
+  - id: nonhemolytic
+    notes: One minus the hemolysis probability of the Macrel package's hemolysis classifier (trained on HemoPI-1 records).
+      Higher is better. Peptides that score high on activity tend to score low here.
+  - id: nontoxic
+    notes: One minus the Hybrid Score of ToxinPred3 (version 1.4, model 2, an extra-trees model with motif scores trained
+      on toxic and non-toxic peptides). Higher is better; a Hybrid Score above 0.38 is its own cut-off for a toxic peptide.
+  - id: apex_ecoli
+    notes: Terminal scoring only.
+  - id: apex_saureus
+    notes: Terminal scoring only.
+  - id: apex_paeruginosa
+    notes: Terminal scoring only.
+  source_roles:
+    primary:
+      reward_pool:
+      - activity_ecoli
+      - activity_saureus
+      - activity_paeruginosa
+      - amp_likelihood
+      - nonhemolytic
+      - nontoxic
+      sentinel_pool: []
+      required_enabled_oracles:
+      - activity_ecoli
+      required_sentinels: []
+      audit_oracles:
+      - apex_ecoli
+      - apex_saureus
+      - apex_paeruginosa
+initial_reward_spec:
+  enabled_oracles:
+  - activity_ecoli
+  - amp_likelihood
+  - nontoxic
+  held_out_oracles: []
+  transforms: []
+  aggregator:
+    name: weighted_sum
+    weights:
+      activity_ecoli: 1.0
+      amp_likelihood: 1.0
+      nontoxic: 1.0
+  shape: null
+  penalties: []
+  gates: []
+  invalid_penalty: -1.0
+  reward_clip_low: -1.0
+  hyperparameters:
+    lr: 1.0e-05
+    kl: 0.03
+    group_size: 16
+    steps: 256
+delivery:
+  count: 30
+  protocol: selected_evaluation_library_v1
+  evaluation_candidates: 1000
+  ranking: E. coli activity, 1 / (1 + predicted MIC in micromolar)
+  audit:
+  - apex_ecoli
+  - apex_saureus
+  - apex_paeruginosa
+  selection_aggregation: primary
+framework:
+  terminal_eligibility:
+    rule_id: complete_evidence_advisory_flags_v2
+    required_monitors: []
+    required_strata:
+    - AMP
+  iteration_budget: 15
+  default_steps_per_iter: 256
+  fixed_steps: false
+  min_steps_per_iter: 128
+  max_steps_per_iter: 1024
+  checkpoint_save_steps: 64
+  critic_max_revisions: 2
+  # The windows of the chorismate-mutase contract: lr at half to three times its initial 1e-5, kl at a sixth to twice its
+  # initial 0.03, so that a candidate cannot hold the policy still and still call it training.
+  learning_rate_bounds:
+  - 5.0e-06
+  - 3.0e-05
+  kl_bounds:
+  - 0.005
+  - 0.06
+success:
+  # Qualified: 30 distinct legal peptides whose mean nontoxic score is at least 0.62 (ToxinPred3 Hybrid Score at most 0.38,
+  # its own cut-off) and whose mean amp_likelihood is at least 0.5 (Macrel's own cut-off). Both are the tools' defaults.
+  requirements:
+  - id: complete_delivery
+    metric: generated_count
+    strata:
+    - AMP
+    minimum: 30
+  - id: nontoxic_mean
+    metric: nontoxic_mean
+    strata:
+    - AMP
+    minimum: 0.62
+  - id: amp_likelihood_mean
+    metric: amp_likelihood_mean
+    strata:
+    - AMP
+    minimum: 0.5
+  - id: valid_condition
+    metric: condition_valid_ratio
+    strata:
+    - AMP
+    minimum: 1.0
+    min_count: 30
+  ranking:
+  - metric: amp_selection_score
+    strata:
+    - AMP
+    direction: maximize
+  stop_when_qualified: false
+  metric_sources:
+    generated_count:
+    - activity_ecoli
+    nontoxic_mean:
+    - nontoxic
+    amp_likelihood_mean:
+    - amp_likelihood
+    amp_selection_score:
+    - activity_ecoli
+    condition_valid_ratio: []

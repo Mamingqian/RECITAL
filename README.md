@@ -4,28 +4,30 @@ RECITAL searches for the reward-and-training recipe of a biological sequence gen
 language-model Strategist proposes candidate recipes, deterministic validators check them, each accepted candidate
 trains as its own GRPO job, and the Strategist reads a ledger of the measured libraries to propose the next round. A
 Coder agent can write new reward components that run in a sandbox. Every prompt, decision, measurement and delivered
-library is recorded in a hash-chained event log. Three task families share the engine: Loop-seq DNA cyclizability,
-cell-type-specific enhancers (CRE) and chorismate mutase (CM).
+library is recorded in a hash-chained event log. Four task families share the engine: Loop-seq DNA cyclizability,
+cell-type-specific enhancers (CRE), chorismate mutase (CM) and antimicrobial peptide (AMP) design.
 
 Paper: *Agentic Adaptation of Rewards and Training for Biological Sequence Design* (manuscript to be submitted).
 Code: <https://github.com/Mamingqian/RECITAL>, released under the Apache License 2.0 (`LICENSE`).
 
 This repository holds the framework, the prompts of the Strategist, Critic and Coder, the recipe schema, the reward
-components and the task declarations. The analysis and baseline scripts, the third-party model code and the search
-records of the paper's runs are not part of it; the external models are installed separately (see below).
+components, the task declarations, the controlled search arms and the read-only analysis scripts (`scripts/analysis/`).
+Third-party model code and weights are not part of it and are installed separately (see below); the search records and
+delivered libraries of the paper's runs are archived on Zenodo.
 
 ## Where things are
 
 | Item | Path |
 |---|---|
-| Framework | `src/recital/control/` (entry point `cli.py`, the round loop in `engine.py`) |
+| Framework | `src/recital/control/` (entry point `cli.py`, the round loop in `engine.py`, controlled search arms in `arms.py`, `macamp.py` and `ext/`) |
 | Agent prompts | Strategist and Critic: `src/recital/control/prompts.py` (`STRATEGIST_SYSTEM`, `CRITIC_SYSTEM`, the Coder-available note and the header of every decision). Coder: `system_prompt` in `src/recital/control/coder.py`. The health and composition legends the Strategist reads are in `ledger.py` |
 | Recipe schema | `src/recital/control/schemas.py` (`round_response_schema`; the checks a recipe passes are in `recipes.py`) |
-| Reward components (primitive registry) | `src/recital/spec/registry.py` (the components are in `src/recital/spec/primitives/`, `src/tasks/dna/primitives.py` and `src/tasks/protein/primitives.py`) |
-| Task declarations | `configs/`: per task a run config (`<task>_experiment.yaml`), its contract (`<task>_contract.yaml`, named by `contract_path`) and, for CRE and Loop-seq, the initial recipe (`<task>_initial_spec.json`) |
+| Reward components (primitive registry) | `src/recital/spec/registry.py` (the components are in `src/recital/spec/primitives/`, `src/tasks/dna/primitives.py`, `src/tasks/protein/primitives.py` and `src/tasks/amp/families.py`) |
+| Task declarations | `configs/`: per task a run config (`<task>_experiment.yaml`, plus broad-spectrum, conflict-objective and controlled-arm AMP configs), its contract (`<task>_contract.yaml`, named by `contract_path`) and, for CRE and Loop-seq, the initial recipe (`<task>_initial_spec.json`) |
+| Analysis & readout scripts | `scripts/analysis/` (read-only endpoint tables, exact permutation and Fisher contrasts, decision-trace audit, and manuscript number generators) |
 
 The rest of `src/recital/` is the science layer: the GRPO trainer, reward composition (`spec/`), the library
-selectors and the sandbox that runs Coder-written components (`synthesis/`). `src/tasks/` holds the three task
+selectors and the sandbox that runs Coder-written components (`synthesis/`). `src/tasks/` holds the four task
 packages (adapter, oracle wrappers, contract) and the alphabet-scoped primitives.
 
 ## Install
@@ -64,6 +66,13 @@ python -m recital.control.cli run       --config configs/loopseq_experiment.yaml
 
 python -m recital.control.cli preflight --config configs/cm_experiment.yaml      --output "$RUNS/cm_seed0"      --seed 0
 python -m recital.control.cli run       --config configs/cm_experiment.yaml      --output "$RUNS/cm_seed0"      --seed 0
+
+python -m recital.control.cli preflight --config configs/amp_experiment.yaml     --output "$RUNS/amp_seed3101"  --seed 3101
+python -m recital.control.cli run       --config configs/amp_experiment.yaml     --output "$RUNS/amp_seed3101"  --seed 3101
+
+# controlled baselines on the same engine: fixed recipe and non-LLM random recipe search
+python -m recital.control.cli fixed-recipe --config configs/amp_experiment.yaml --output-root "$RUNS/amp_fixed" --steps 1280 --seeds 3101 3102 3103
+python -m recital.control.cli arm-search   --config configs/amp_reward_only_experiment.yaml --arm random --output-root "$RUNS/amp_random" --seeds 3101 3102 3103
 
 # a campaign: one cell per seed
 python -m recital.control.cli campaign --config configs/loopseq_experiment.yaml --output-root "$RUNS/loopseq" --seeds 0 1 2
@@ -125,6 +134,7 @@ the package imports without them; running a task needs the ones it uses.
 | CRE | the `promoter_rl` scorer package (path in `src/tasks/promoter/assets.py`) with Malinois (boda2), the Agarwal lentiMPRA model and ChromBPNet weights; `enformer-pytorch` and a fine-tuned Enformer checkpoint; a JASPAR MEME motif file for the grammar prior; the Gosai et al. MPRA dataset |
 | Loop-seq | DNAcycP2 (its own Python environment, called as a subprocess); MIXBend (DNABERT-6) and BendNet, each through a `scorer: package.module:factory` entry that wraps the upstream code; the trained CNN ensemble checkpoints and the Loop-seq dataset (`src/tasks/loopseq/assets.py`) |
 | CM | ProGen3-112M, ESM2-35M and ESM2-650M, the ProtT5 encoder (Hugging Face); PoET-2 in its own environment (non-commercial model license); the natural family and DCA parameters of Russ et al. 2020 and Netti et al. 2026 |
+| AMP | AMP-Prompt checkpoint and GPT-2 MIC regressors (`https://doi.org/10.5281/zenodo.17018363`), GRAMPA public MIC table (`grampa.csv`), Macrel 1.6.1, ToxinPred3 1.4, ESMFold v1 (`facebook/esmfold_v1`, for constrained multi-objective design) and APEX 1.1 (each subprocess scorer in its own Python environment under `backends/amp_assets/`) |
 
 The CM prerequisites (data, fitted function heads, the SFT policy) are built by `scripts/run_cm.py` (`--stage prepare`,
 `oracles`, `sft`), `scripts/qualify_cm.py` and `scripts/develop_cm.py`. Set `LOOPSEQ_ASSET_ROOT` and `PROMOTER_ASSET_ROOT` to move the

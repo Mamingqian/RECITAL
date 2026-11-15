@@ -199,6 +199,9 @@ def measurement_source(name: str) -> str | None:
     return name.rsplit("/", 1)[1] if "/" in name else None
 
 
+LEVERS_DEFAULT = ["reward", "training"]
+
+
 class ControlContract(_Model):
     proposals: Proposals
     budget: Budget
@@ -209,6 +212,20 @@ class ControlContract(_Model):
     synthesis: SynthesisSpec
     llm: LlmSpec
     scheduler: SchedulerSpec
+    # The levers of a recipe the search may edit; the others are frozen to the parent's values. Both is the default.
+    levers: list[Literal["reward", "training"]] = Field(default_factory=lambda: list(LEVERS_DEFAULT))
+    # False withholds the oracle-free checks' text from the Strategist and Critic: the library-health and composition
+    # legends, the composition line and the pairwise_ratio and unique_kmer_ratio columns of a row, library_health in the
+    # header's contract summary and the primitives' rationale. The engine's qualification is unchanged.
+    checks_text: bool = True
+    # The optional modules this search runs, `{name: its own config}`; see `recital.control.ext`. None is the core.
+    modules: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _levers_open(self) -> "ControlContract":
+        if not self.levers or len(set(self.levers)) != len(self.levers):
+            raise ValueError("control.levers names each of reward and training at most once, and at least one")
+        return self
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControlContract":
@@ -230,8 +247,15 @@ class ControlContract(_Model):
 
         Recorded in `run_started` as provenance. Nothing compares it.
         """
+        control = self.model_dump(mode="json", exclude={"llm", "scheduler"})
+        if sorted(control["levers"]) == sorted(LEVERS_DEFAULT):
+            del control["levers"]  # a default leaves the hash of every earlier config unchanged
+        if control["checks_text"]:
+            del control["checks_text"]
+        if not control["modules"]:
+            del control["modules"]
         payload = {
-            "control": self.model_dump(mode="json", exclude={"llm", "scheduler"}),
+            "control": control,
             "llm_model": self.llm.model,
         }
         return sha256_hex(canonical_json(payload))

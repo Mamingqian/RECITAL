@@ -21,6 +21,7 @@ from . import events as ev
 from . import recipes as rc
 from .backend import SequenceExperimentBackend
 from .contract import ControlContract
+from . import ext
 from .engine import ComponentRunner, Engine, EngineSettings
 from .errors import ControlError
 from .jobs import write_json
@@ -28,6 +29,7 @@ from .jsonio import canonical_json, sha256_hex
 from .guard import blind_projection
 from .projection import ArmView
 from .prompts import static_header, strategist_instructions
+from .recipes import LEVERS
 from .runtime_build import (build_runtime, experiment_recipe_capabilities, mount_synthesis, persist_oracle_versions,
                             preflight)
 from .scheduler import Scheduler
@@ -175,16 +177,18 @@ def header_for(task, control: ControlContract, ctx: rc.RecipeContext, success: S
         task=shown(public["task"]), conditions=list(task.conditions),
         delivery_requirements=shown(public["delivery_requirements"]), sources=shown(cards),
         hyperparameter_bounds=shown(public["capabilities"]["hyperparameters"]),
-        primitives=shown(primitive_section(catalog)),
+        primitives=shown(primitive_section(catalog if control.checks_text else [
+            {key: value for key, value in entry.items() if key != "description"} for entry in catalog])),
         contract_summary={
             "candidates_per_round": control.proposals.candidates_per_round,
             "anchor": control.proposals.anchor_candidate,
             "rounds": {"minimum_before_a_stop": control.proposals.rounds_min, "maximum": control.proposals.rounds_max},
             "candidate_budget": control.proposals.candidate_budget,
             "steps": control.budget.steps.model_dump(), "total_updates": task.total_updates,
-            "library_health": control.health.model_dump(),
+            **({"library_health": control.health.model_dump()} if control.checks_text else {}),
             "components_available": control.synthesis.enabled,
-            "stop": "needs every condition assigned a qualified completed candidate"},
+            "stop": "needs every condition assigned a qualified completed candidate",
+            **({} if sorted(control.levers) == sorted(LEVERS) else {"levers_open": list(control.levers)})},
         selection_rule=selection_rule_text(control.selection.plan), ranking=ranking_text(success),
         initial_recipe=shown(rc.visible_recipe(ctx.initial_recipe, task.visible_sources)))
 
@@ -249,11 +253,15 @@ def prepare(
         source_commit=source_commit(repo_root),
         oracle_versions_hash=sha256_hex(canonical_json(runtime.get("oracle_versions", {}))),
         model=control.llm.model, llm=control.llm.model_dump(mode="json"))
+    extensions = ext.build(control.modules)
     settings = EngineSettings(
         run_dir=run_dir, config_path=config_path, repo_root=repo_root, device=device, task=task, control=control,
         recipe_ctx=ctx, success=success, definitions=runtime["measurement_definitions"],
         generation_plan=generation_plan(None, task), header_text=header_text,
-        instructions=strategist_instructions(synthesis=control.synthesis.enabled), run_header=header,
+        instructions=strategist_instructions(synthesis=control.synthesis.enabled, levers=control.levers,
+                                             checks_text=control.checks_text,
+                                             modules=[extension.instructions() for extension in extensions]),
+        run_header=header, extensions=extensions,
         primitives=lambda: primitive_names(capabilities_of()))
     log = EventLog(run_dir / "events" / "log.jsonl")
     blobs = BlobStore(run_dir)

@@ -33,13 +33,15 @@ class ArmView:
 
     hidden_names: frozenset[str]
     blind: bool
+    checks_text: bool = True
 
     @classmethod
-    def from_task(cls, task_contract) -> "ArmView":
+    def from_task(cls, task_contract, *, checks_text: bool = True) -> "ArmView":
         visible = task_contract.visible_sources
         hidden = {tool.name for tool in task_contract.tools if tool.name not in visible}
         hidden |= set(task_contract.terminal_blind_sources)
-        return cls(hidden_names=frozenset(hidden), blind=task_contract.protocol_condition != "self_validating")
+        return cls(hidden_names=frozenset(hidden), blind=task_contract.protocol_condition != "self_validating",
+                   checks_text=checks_text)
 
     def scrub(self, text: str) -> str:
         return scrub_text(text, self.hidden_names)
@@ -64,8 +66,11 @@ def _blob(store: BlobStore, sha: str) -> dict[str, Any]:
     return store.get_json(sha)
 
 
-def ledger_blocks(state: RunState, store: BlobStore, arm: ArmView) -> list[Block]:
-    """Rows in the order they became facts: a round's components, its candidates, then its critic advisory."""
+def ledger_blocks(state: RunState, store: BlobStore, arm: ArmView, extensions: Sequence[Any] = ()) -> list[Block]:
+    """Rows in the order they became facts: a round's components, its candidates, then its critic advisory.
+
+    A module's blocks follow each round's rows (`round_blocks`) and the last round (`ledger_blocks`).
+    """
     blocks: list[Block] = []
     for rnd in state.rounds:
         for request in sorted((c for c in state.components.values() if c.round == rnd.index),
@@ -79,9 +84,14 @@ def ledger_blocks(state: RunState, store: BlobStore, arm: ArmView) -> list[Block
             if candidate.ledger_row_sha is None:
                 continue
             shown = visible_row(_blob(store, candidate.ledger_row_sha), scrub=arm.scrub)
-            blocks.append(Block(render_row(shown), render_row(shown.model_copy(update={"hypothesis": ""}))))
+            blocks.append(Block(render_row(shown, checks_text=arm.checks_text),
+                                render_row(shown.model_copy(update={"hypothesis": ""}), checks_text=arm.checks_text)))
         if rnd.critic_row_sha is not None:
             blocks.append(Block(render_advisory_row(_blob(store, rnd.critic_row_sha)), ""))
+        for extension in extensions:
+            blocks.extend(extension.round_blocks(state, store, arm, rnd))
+    for extension in extensions:
+        blocks.extend(extension.ledger_blocks(state, store, arm))
     return blocks
 
 
@@ -97,8 +107,12 @@ def evidence_of(state: RunState, store: BlobStore) -> list[Evidence]:
 
 
 def build_tail(state: RunState, store: BlobStore, *, control: ControlContract, success: SuccessSpec,
-               conditions: Sequence[str], stop_only: bool, b_effective: int, kept: Sequence[str]) -> str:
-    """`b_effective` is the number of candidates still to propose; `kept` describes those already accepted."""
+               conditions: Sequence[str], stop_only: bool, b_effective: int, kept: Sequence[str],
+               extra: Sequence[str] = ()) -> str:
+    """`b_effective` is the number of candidates still to propose; `kept` describes those already accepted.
+
+    `extra` are a module's lines, placed before the instruction.
+    """
     proposals = control.proposals
     round_index = state.open_round.index if state.open_round else state.next_round
     lines = [
@@ -122,6 +136,7 @@ def build_tail(state: RunState, store: BlobStore, *, control: ControlContract, s
                 lines.append(f"Your previous answer this round ({what}) was refused:\n- " + "\n- ".join(found))
     if kept:
         lines.append("Already accepted this round and kept; do not propose them again: " + "; ".join(kept) + ".")
+    lines.extend(extra)
     if stop_only:
         lines.append("Instruction: the search is over. Return kind stop with outcome deliver and one completed "
                      "candidate per condition, or outcome no_qualified_candidate if some condition has none qualified.")
@@ -135,9 +150,10 @@ def build_tail(state: RunState, store: BlobStore, *, control: ControlContract, s
 
 
 def render_with_tail(state: RunState, store: BlobStore, *, arm: ArmView, header: str, instructions: str,
-                     tail: str, limit: int, schema: Mapping[str, Any], tools: Sequence[Any]) -> Rendered:
+                     tail: str, limit: int, schema: Mapping[str, Any], tools: Sequence[Any],
+                     extensions: Sequence[Any] = ()) -> Rendered:
     """The full request around a given tail, checked for blinding and for the prompt budget."""
-    blocks = ledger_blocks(state, store, arm)
+    blocks = ledger_blocks(state, store, arm, extensions)
     ledger = "## Ledger\n" + ("\n".join(block.text for block in blocks) if blocks else "(no candidates yet)")
     system_instructions = f"{instructions}\n\n{header}"
     tripwire(system_texts=[system_instructions, tail, *[block.system_text for block in blocks]],
@@ -152,11 +168,13 @@ def render_with_tail(state: RunState, store: BlobStore, *, arm: ArmView, header:
 
 def render(state: RunState, store: BlobStore, *, arm: ArmView, header: str, instructions: str,
            control: ControlContract, success: SuccessSpec, conditions: Sequence[str], stop_only: bool,
-           b_effective: int, schema: Mapping[str, Any], tools: Sequence[Any], kept: Sequence[str]) -> Rendered:
+           b_effective: int, schema: Mapping[str, Any], tools: Sequence[Any], kept: Sequence[str],
+           extensions: Sequence[Any] = ()) -> Rendered:
     tail = build_tail(state, store, control=control, success=success, conditions=conditions,
-                      stop_only=stop_only, b_effective=b_effective, kept=kept)
+                      stop_only=stop_only, b_effective=b_effective, kept=kept,
+                      extra=[line for extension in extensions for line in extension.tail_lines(state, store, arm)])
     return render_with_tail(state, store, arm=arm, header=header, instructions=instructions, tail=tail,
-                            limit=control.llm.max_prompt_tokens, schema=schema, tools=tools)
+                            limit=control.llm.max_prompt_tokens, schema=schema, tools=tools, extensions=extensions)
 
 
 def visible_scalar_names(definitions: Mapping[str, Mapping[str, Any]], visible_sources: Sequence[str]) -> list[str]:
@@ -234,3 +252,18 @@ class Retriever:
         if len(text) > TOOL_RESULT_CAP:
             raise ToolRejected(f"the result is {len(text)} characters, over the {TOOL_RESULT_CAP} cap; {advice}")
         return json.loads(text)
+
+
+def render_standalone(store: BlobStore, *, arm: ArmView, instructions: str, payload: str, limit: int, schema: Mapping[str, Any],
+                      system_texts: Sequence[str] = ()) -> Rendered:
+    """A one-message request that is not the ledger (a module's own call), checked for blinding and the prompt budget.
+
+    `system_texts` are the texts the module wrote, beside the instructions, that the tripwire reads. The prompt hash and the manifest
+    are defined as `render_with_tail` defines them, so `llm_fields` records the request the same way.
+    """
+    tripwire(system_texts=[instructions, *system_texts], hidden_names=arm.hidden_names)
+    tokens = check_prompt_budget([instructions, payload], limit=limit, schema=schema, tools=())
+    items = ({"role": "user", "content": payload},)
+    manifest = tuple(store.put(text.encode("utf-8")) for text in (instructions, payload))
+    prompt_hash = sha256_hex(canonical_json({"instructions": instructions, "input": list(items)}))
+    return Rendered(instructions, items, manifest, prompt_hash, tokens)

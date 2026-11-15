@@ -20,6 +20,11 @@ from .jsonio import canonical_json, sha256_hex
 START_TO_MODE = {"from_initial": "initial_restart", "from_parent": "weights_new_stage",
                  "continue_parent": "full_state_continuation"}
 EDITED_HYPERPARAMETERS = ("lr", "kl", "group_size")
+# The candidate fields each lever of `control.levers` owns; a lever a search does not hold open is frozen to the parent's
+# recipe (a null field inherits), so its fields are neither offered in the response schema nor accepted by `resolve`.
+LEVER_FIELDS = {"training": ("steps", "lr", "kl", "group_size"),
+                "reward": ("enabled_oracles", "aggregator", "oracle_utilities", "penalties", "gates")}
+LEVERS = ("reward", "training")
 # A job killed mid-training resumes from its newest full-state checkpoint, so one is kept every this many updates.
 RECOVERY_INTERVAL = 500
 SENTINEL_ROLES = ("required_sentinel", "sentinel", "spendable_sentinel")
@@ -42,6 +47,7 @@ class RecipeContext:
     steps_max: int
     total_updates: int
     validate_recipe: Callable[[dict[str, Any]], list[str]] = field(compare=False)
+    levers: tuple[str, ...] = LEVERS
 
 
 def context_from(task_contract, control, validate_recipe: Callable[[dict[str, Any]], list[str]]) -> RecipeContext:
@@ -63,7 +69,7 @@ def context_from(task_contract, control, validate_recipe: Callable[[dict[str, An
         sentinel_sources=frozenset(name for name in visible if tools[name].declared_role in SENTINEL_ROLES),
         steps_min=control.budget.steps.min, steps_default=control.budget.steps.default,
         steps_max=control.budget.steps.max, total_updates=task_contract.total_updates,
-        validate_recipe=validate_recipe)
+        validate_recipe=validate_recipe, levers=tuple(control.levers))
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,11 @@ def resolve(
         return None, [_problem("bad_start", "start", f"{start!r} is not one of {sorted(START_TO_MODE)}")]
     if start != "from_initial" and parent_id == "initial":
         problems.append(_problem("bad_start", "start", "the initial policy can only be restarted: use from_initial"))
+    for lever, names in LEVER_FIELDS.items():
+        if lever not in ctx.levers:
+            problems += [_problem("lever_frozen", key, f"{key} belongs to the {lever} lever, which this search holds "
+                                                       "fixed; leave it null")
+                         for key in names if proposal.get(key) is not None]
     steps = proposal.get("steps")
     steps = ctx.steps_default if steps is None else steps
     if not ctx.steps_min <= steps <= ctx.steps_max:

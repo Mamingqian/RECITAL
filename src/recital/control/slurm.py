@@ -79,6 +79,7 @@ _PENDING = frozenset({"PENDING", "CONFIGURING"})
 _RUNNING = frozenset({"RUNNING", "COMPLETING", "SUSPENDED"})
 _FAILED = frozenset({"FAILED", "NODE_FAIL", "BOOT_FAIL", "OUT_OF_MEMORY", "DEADLINE", "PREEMPTED", "REVOKED"})
 _NO_SUCH_JOB = re.compile(r"invalid job id", re.IGNORECASE)
+_ALREADY_ENDED = re.compile(r"invalid job id|already completing or completed", re.IGNORECASE)
 _TRANSIENT = re.compile(
     r"timed out|unable to contact|temporarily|connection (?:refused|reset)|not responding|"
     r"zero bytes were transmitted|persistent connection|transport endpoint|try again",
@@ -290,6 +291,11 @@ class SlurmScheduler:
             return self._unseen_status(job_id, status.reason)
         self._unseen.pop(job_id, None)
         return status
+
+    def cancel(self, handle: JobHandle) -> None:
+        code, out, err = self.runner(["scancel", handle.job_id], timeout=QUERY_TIMEOUT)
+        if code != 0 and not _ALREADY_ENDED.search(err):
+            raise SchedulerUnreachable(_failure("scancel", code, err))
 
     def _unseen_status(self, job_id: str, reason: str | None) -> JobStatus:
         count = self._unseen.get(job_id, 0) + 1

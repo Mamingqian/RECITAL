@@ -247,12 +247,26 @@ def _line(label: str, value: Any) -> str:
     return f" {label}: {_compact(value)}"
 
 
-def render_row(row: VisibleRow, *, cap: int = ROW_TOKEN_CAP) -> str:
+CHECK_COLUMNS = ("pairwise_ratio", "unique_kmer_ratio")
+
+
+def without_checks(row: VisibleRow) -> VisibleRow:
+    """The row with the oracle-free checks' columns and the composition line left out; `qualified` stays."""
+    def kept(table):
+        return None if table is None else {condition: {name: value for name, value in values.items()
+                                                       if name not in CHECK_COLUMNS}
+                                           for condition, values in table.items()}
+    return row.model_copy(update={"pool": kept(row.pool), "library": kept(row.library), "composition": None})
+
+
+def render_row(row: VisibleRow, *, cap: int = ROW_TOKEN_CAP, checks_text: bool = True) -> str:
     """Line-oriented text of one row; over `cap` tokens it drops what the ledger already implies, in a fixed order.
 
     The cap never removes a measurement the instructions describe: the pool and library columns (composition
     included) stay, so a row over the cap is sent whole.
     """
+    if not checks_text:
+        row = without_checks(row)
     droppable = ["vs_parent", "text.short"]
     dropped: set[str] = set()
     while True:

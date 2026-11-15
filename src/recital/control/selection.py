@@ -126,6 +126,24 @@ def best_assignment(success: SuccessSpec, candidates: Sequence[Evidence],
     return picks
 
 
+def best_candidate(success: SuccessSpec, candidates: Sequence[Evidence], conditions: Sequence[str]) -> str | None:
+    """The one candidate qualified in every condition that the declared ranking puts first; None when none is.
+
+    Each criterion is read over its own declared strata (`success.ranking_value`), so this ranks a candidate as a whole
+    where `rank_condition` ranks it one condition at a time. Ties follow the same tolerance chain and fall to the
+    earlier candidate.
+    """
+    pool = []
+    for item in candidates:
+        if not item.ok or not all(condition_status(item.qualification, c).qualified for c in conditions):
+            continue
+        measured = (item.qualification or {}).get("measurements") or {}
+        values = tuple(ranking_value(criterion, measured) for criterion in success.ranking)
+        if all(value is not None for value in values):
+            pool.append((item, values, tuple(ranking_error(criterion, measured) for criterion in success.ranking)))
+    return _winner(success, pool)[0][0].id if pool else None
+
+
 def validate_assignment(assignment: Mapping[str, str], candidates: Sequence[Evidence],
                         conditions: Sequence[str], *, require_qualified: bool) -> list[Problem]:
     problems: list[Problem] = []
